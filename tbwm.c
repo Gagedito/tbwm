@@ -2406,10 +2406,9 @@ destroynotify(struct wl_listener *listener, void *data)
 		free(c->scroll_title_pixels);
 		c->scroll_title_pixels = NULL;
 	}
-	/* Free scroll scene buffer */
+	/* Detach scroll buffer - scene node is destroyed with c->scene parent */
 	if (c->scroll_scene_buf) {
 		wlr_scene_buffer_set_buffer(c->scroll_scene_buf, NULL);
-		wlr_scene_node_destroy(&c->scroll_scene_buf->node);
 		c->scroll_scene_buf = NULL;
 	}
 	if (c->scroll_buf) {
@@ -6814,11 +6813,20 @@ scrolltimer(void *data)
 	/* Advance scroll offset - one pixel per tick at 30fps */
 	title_scroll_offset++;
 	
-	/* Update window frames that need scrolling */
+	/* Update window frames that need scrolling - FAST PATH ONLY */
 	wl_list_for_each(c, &clients, link) {
 		if (c->needs_title_scroll) {
-			if (!update_scroll_only(c)) {
-				updateframe(c);
+			/* FAST PATH - GPU panning only, zero memcpy */
+			if (c->scroll_scene_buf && c->scroll_title_pixels && 
+			    c->scroll_title_width > 0 && c->scroll_display_width > 0) {
+				int pixel_offset = title_scroll_offset % c->scroll_title_width;
+				struct wlr_fbox src_box = {
+					.x = pixel_offset,
+					.y = 0,
+					.width = c->scroll_display_width,
+					.height = cell_height
+				};
+				wlr_scene_buffer_set_source_box(c->scroll_scene_buf, &src_box);
 			}
 			scroll_count++;
 		}
@@ -7596,13 +7604,7 @@ updatebar(Monitor *m)
 	/* Scroll-only update: skip static content, jump to tabs */
 	if (scroll_only_bar_update && !repl_input_active && !launcher_active && m->bar_tabs_start_x > 0) {
 		x = m->bar_tabs_start_x;
-		/* Clear only tab area */
-		int tab_end = m->bar_tabs_end_x > 0 ? m->bar_tabs_end_x : (width - 30 * cell_width);
-		for (i = 0; i < cell_height; i++) {
-			for (j = x; j < tab_end && j < width; j++) {
-				pixels[i * width + j] = RGB_TO_ARGB(cfg_bar_color);
-			}
-		}
+		/* Don't clear here - we'll clear per-tab only for scrolling tabs */
 		goto render_tabs;
 	}
 
@@ -7793,8 +7795,18 @@ render_tabs:
 				int actual_title_chars = (title_len < title_max - 1) ? title_len : title_max - 1;
 				int actual_tab_width = (actual_title_chars + 2) * cell_width; /* +2 for brackets */
 				
-				/* Draw background for focused */
-				if (is_focused) {
+				/* Check if this tab needs scrolling */
+				int needs_scroll = (title_len > title_max - 1 && title_scroll_mode);
+				
+				/* During scroll-only update, skip tabs that don't need scrolling */
+				if (scroll_only_bar_update && !needs_scroll) {
+					/* Just advance x position, don't re-render */
+					x += actual_tab_width + cell_width / 2;
+					continue;
+				}
+				
+				/* Draw background - always needed for scrolling tabs to clear previous frame */
+				if (is_focused || (scroll_only_bar_update && needs_scroll)) {
 					for (py = 0; py < cell_height; py++) {
 						for (px = x; px < x + actual_tab_width && px < width; px++) {
 							pixels[py * width + px] = bg;
@@ -7805,7 +7817,7 @@ render_tabs:
 				render_char_to_buffer(pixels, width, cell_height, x, 0, '[', fg);
 				x += cell_width;
 				
-				if (title_len > title_max - 1 && title_scroll_mode) {
+				if (needs_scroll) {
 					/* Smooth pixel-based scrolling for top bar tabs */
 					/* First decode title to codepoints */
 					unsigned long title_cps[256];
@@ -8343,11 +8355,14 @@ setup_scroll_scene_buffer(Client *c, uint32_t fg_color, uint32_t bg_color)
 {
 	int total_width;
 	struct wlr_fbox src_box;
+	int need_upload = 0;
 	
-	if (!c || !c->scroll_title_pixels || c->scroll_title_width <= 0)
+	if (!c || !c->scroll_title_pixels || c->scroll_title_width <= 0) {
 		return;
-	if (c->scroll_display_width <= 0 || c->scroll_dest_x <= 0)
+	}
+	if (c->scroll_display_width <= 0 || c->scroll_dest_x <= 0) {
 		return;
+	}
 	
 	total_width = c->scroll_title_width * 2;
 	
@@ -8367,29 +8382,38 @@ setup_scroll_scene_buffer(Client *c, uint32_t fg_color, uint32_t bg_color)
 		c->scroll_buf->data = ecalloc(1, c->scroll_buf->stride * cell_height);
 		wlr_buffer_init(&c->scroll_buf->base, &titlebuf_impl, total_width, cell_height);
 		titlebuf_alloc_count++;
+		need_upload = 1; /* New buffer - need to copy pixels */
 	}
 	
-	/* Copy pre-rendered pixels to the buffer */
-	memcpy(c->scroll_buf->data, c->scroll_title_pixels, 
-	       total_width * cell_height * sizeof(uint32_t));
+	/* Only copy pre-rendered pixels if buffer was just created */
+	if (need_upload) {
+		memcpy(c->scroll_buf->data, c->scroll_title_pixels, 
+		       total_width * cell_height * sizeof(uint32_t));
+	}
 	
 	/* Create scene buffer if needed */
 	if (!c->scroll_scene_buf) {
 		c->scroll_scene_buf = wlr_scene_buffer_create(c->scene, NULL);
-		if (!c->scroll_scene_buf) return;
+		if (!c->scroll_scene_buf) {
+			return;
+		}
+		need_upload = 1; /* Need to set buffer on scene */
 	}
 	
 	/* Position the overlay exactly over the title area in the frame */
 	wlr_scene_node_set_position(&c->scroll_scene_buf->node, 
 	                            c->scroll_dest_x, 0);
 	
-	/* Set buffer and initial source box */
-	wlr_scene_buffer_set_buffer(c->scroll_scene_buf, &c->scroll_buf->base);
+	/* Only update buffer binding if we just uploaded new pixels */
+	if (need_upload) {
+		wlr_scene_buffer_set_buffer(c->scroll_scene_buf, &c->scroll_buf->base);
+	}
 	wlr_scene_buffer_set_dest_size(c->scroll_scene_buf, 
 	                               c->scroll_display_width, cell_height);
 	
-	/* Set source box to show first portion of the 2x buffer */
-	src_box.x = 0;
+	/* Set source box to show current scroll position */
+	int pixel_offset = title_scroll_offset % c->scroll_title_width;
+	src_box.x = pixel_offset;
 	src_box.y = 0;
 	src_box.width = c->scroll_display_width;
 	src_box.height = cell_height;
