@@ -46,10 +46,16 @@ install_deps() {
     info "Installing dependencies..."
     
     case "$DISTRO" in
-        arch|endeavouros|manjaro|garuda|cachyos)
-            # Arch-based
+        arch|endeavouros|manjaro|garuda|cachyos|artix)
+            # Arch-based. Artix ships wlroots 0.19 as the wlroots0.19 package;
+            # on Arch the regular wlroots package is already 0.19+.
+            if [ "$DISTRO" = "artix" ]; then
+                WLROOTS_PKG="wlroots0.19"
+            else
+                WLROOTS_PKG="wlroots"
+            fi
             sudo pacman -S --needed --noconfirm \
-                wlroots wayland wayland-protocols libinput libxkbcommon \
+                "$WLROOTS_PKG" wayland wayland-protocols libinput libxkbcommon \
                 pixman freetype2 pango cairo libxcb xcb-util-wm \
                 xorg-xwayland meson ninja gcc pkgconf make git \
                 fontconfig ttf-font || true
@@ -184,7 +190,7 @@ build_wlroots() {
     
     # Install meson build deps
     case "$DISTRO" in
-        arch|endeavouros|manjaro|garuda|cachyos)
+        arch|endeavouros|manjaro|garuda|cachyos|artix)
             sudo pacman -S --needed --noconfirm \
                 meson ninja hwdata libdisplay-info libliftoff seatd || true
             ;;
@@ -209,6 +215,9 @@ build_wlroots() {
     cd wlroots
     
     info "Configuring..."
+    if ! command -v meson >/dev/null 2>&1 || ! command -v ninja >/dev/null 2>&1; then
+        error "meson/ninja not found. Install them and re-run (e.g. 'sudo pacman -S meson ninja' on Arch/Artix, 'sudo apt install meson ninja-build' on Debian/Ubuntu)."
+    fi
     meson setup build --prefix=/usr/local -Dexamples=false
     
     info "Building..."
