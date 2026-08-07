@@ -61,7 +61,8 @@ install_deps() {
                 "$WLROOTS_PKG" wayland wayland-protocols libinput libxkbcommon \
                 pixman freetype2 pango cairo libxcb xcb-util-wm \
                 xorg-xwayland meson ninja gcc pkgconf make git \
-                fontconfig ttf-font grim slurp wl-clipboard $NET_DEPS || true
+                fontconfig ttf-font grim slurp wl-clipboard $NET_DEPS \
+                xdg-desktop-portal xdg-desktop-portal-gtk xdg-desktop-portal-wlr || true
             ;;
         debian|ubuntu|pop|linuxmint|elementary)
             # Debian-based - note: libwlroots-dev often not available or too old
@@ -385,13 +386,23 @@ install_tbwm() {
         warn "tbwm-network not found; the network menu (WiFi/Bluetooth) will be empty"
     fi
     
+    # tbwm-session launcher (starts a session D-Bus bus so Flatpak apps and
+    # the XDG desktop portals can connect)
+    if [ -f "$SCRIPT_DIR/tbwm-session" ]; then
+        sudo cp "$SCRIPT_DIR/tbwm-session" /usr/local/bin/tbwm-session
+        sudo chmod 755 /usr/local/bin/tbwm-session
+        success "Installed /usr/local/bin/tbwm-session"
+    else
+        warn "tbwm-session not found; apps may have no session D-Bus bus (Flatpak/portals may fail)"
+    fi
+    
     # Session file for display managers
     sudo mkdir -p /usr/share/wayland-sessions
     sudo tee /usr/share/wayland-sessions/tbwm.desktop > /dev/null << 'EOF'
 [Desktop Entry]
 Name=TurboWM
 Comment=A Wayland compositor with s7 Scheme configuration
-Exec=/usr/local/bin/tbwm
+Exec=/usr/local/bin/tbwm-session
 Type=Application
 EOF
     success "Installed session file"
@@ -501,7 +512,8 @@ main() {
     echo ""
     echo "To use TurboWM:"
     echo "  • Log out and select 'TurboWM' from your display manager"
-    echo "  • Or run: tbwm (from a TTY)"
+    echo "  • Or run: tbwm-session (from a TTY) - starts a session D-Bus bus"
+    echo "    (use 'tbwm' directly only if you know you don't need one)"
     echo ""
     echo "Config file: ~/.config/tbwm/config.scm"
     echo ""
