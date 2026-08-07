@@ -54,7 +54,7 @@ install_deps() {
             else
                 WLROOTS_PKG="wlroots"
             fi
-            sudo pacman -S --needed --noconfirm \
+            sudo pacman -Sy --needed --noconfirm \
                 "$WLROOTS_PKG" wayland wayland-protocols libinput libxkbcommon \
                 pixman freetype2 pango cairo libxcb xcb-util-wm \
                 xorg-xwayland meson ninja gcc pkgconf make git \
@@ -191,7 +191,7 @@ build_wlroots() {
     # Install meson build deps
     case "$DISTRO" in
         arch|endeavouros|manjaro|garuda|cachyos|artix)
-            sudo pacman -S --needed --noconfirm \
+            sudo pacman -Sy --needed --noconfirm \
                 meson ninja hwdata libdisplay-info libliftoff seatd || true
             ;;
         debian|ubuntu|pop|linuxmint|elementary)
