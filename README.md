@@ -14,7 +14,7 @@ features:
 
 just run:
 ```bash
-git clone https://github.com/WheeledCord/tbwm
+git clone https://github.com/Gagedito/tbwm
 cd tbwm
 ./install.sh
 ```
@@ -37,7 +37,7 @@ dependencies:
 - libxcb, xcb-icccm (for XWayland)
 
 ```bash
-git clone https://github.com/WheeledCord/tbwm
+git clone https://github.com/Gagedito/tbwm
 cd tbwm
 make
 sudo make install
