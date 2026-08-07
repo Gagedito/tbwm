@@ -433,6 +433,22 @@ EOF
     fi
 
     enable_net_services
+
+    # Make the XDG desktop portal frontend pick xdg-desktop-portal-wlr for
+    # screen capture (ScreenCast). The frontend matches XDG_CURRENT_DESKTOP
+    # (tbwm sets it to "tbwm") against each .portal file's UseIn= list, so
+    # "tbwm" must be in that list for the wlr backend to be chosen.
+    WLR_PORTAL="/usr/share/xdg-desktop-portal/portals/wlr.portal"
+    if [ -f "$WLR_PORTAL" ]; then
+        if ! grep -q 'UseIn=.*tbwm' "$WLR_PORTAL"; then
+            sudo sed -i 's/^UseIn=\(.*\)$/UseIn=tbwm;\1/' "$WLR_PORTAL"
+            success "Added tbwm to UseIn in wlr.portal"
+        else
+            info "tbwm already in UseIn of wlr.portal"
+        fi
+    else
+        warn "wlr.portal not found; screen capture (ScreenCast) may not work"
+    fi
 }
 
 # Enable NetworkManager and Bluetooth services for the WiFi/Bluetooth menu

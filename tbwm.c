@@ -10888,6 +10888,12 @@ main(int argc, char *argv[])
 	if (optind < argc)
 		goto usage;
 
+	/* The XDG desktop portal frontend picks its backend (screen capture,
+	 * etc.) by matching XDG_CURRENT_DESKTOP against each .portal file's
+	 * UseIn= list. Without it, no backend is chosen for screen casting. */
+	if (!getenv("XDG_CURRENT_DESKTOP"))
+		setenv("XDG_CURRENT_DESKTOP", "tbwm", 1);
+
 	/* Flatpak apps and XDG desktop portals need a session D-Bus bus */
 	start_session_dbus();
 
