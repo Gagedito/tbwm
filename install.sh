@@ -58,7 +58,7 @@ install_deps() {
                 "$WLROOTS_PKG" wayland wayland-protocols libinput libxkbcommon \
                 pixman freetype2 pango cairo libxcb xcb-util-wm \
                 xorg-xwayland meson ninja gcc pkgconf make git \
-                fontconfig ttf-font || true
+                fontconfig ttf-font grim slurp wl-clipboard || true
             ;;
         debian|ubuntu|pop|linuxmint|elementary)
             # Debian-based - note: libwlroots-dev often not available or too old
@@ -71,7 +71,7 @@ install_deps() {
                 libdrm-dev libgbm-dev libseat-dev \
                 libdisplay-info-dev libliftoff-dev hwdata \
                 meson ninja-build gcc pkg-config make git \
-                fontconfig || true
+                fontconfig grim slurp wl-clipboard || true
             ;;
         fedora|rhel|centos|rocky|almalinux)
             # Fedora/RHEL-based
@@ -81,7 +81,7 @@ install_deps() {
                 freetype-devel pango-devel cairo-devel \
                 libxcb-devel xcb-util-wm-devel xorg-x11-server-Xwayland \
                 meson ninja-build gcc pkg-config make git \
-                fontconfig || true
+                fontconfig grim slurp wl-clipboard || true
             ;;
         opensuse*|suse*)
             # openSUSE
@@ -90,7 +90,7 @@ install_deps() {
                 libinput-devel libxkbcommon-devel libpixman-1-0-devel \
                 freetype2-devel pango-devel cairo-devel \
                 libxcb-devel xwayland meson ninja gcc pkg-config make git \
-                fontconfig || true
+                fontconfig grim slurp wl-clipboard || true
             ;;
         void)
             # Void Linux
@@ -99,7 +99,8 @@ install_deps() {
                 libinput-devel libxkbcommon-devel pixman-devel \
                 freetype-devel pango-devel cairo-devel \
                 libxcb-devel xcb-util-wm-devel xorg-server-xwayland \
-                meson ninja gcc pkg-config make git fontconfig || true
+                meson ninja gcc pkg-config make git fontconfig \
+                grim slurp wl-clipboard || true
             ;;
         gentoo)
             warn "Gentoo detected. Please ensure you have the following USE flags enabled:"
@@ -118,6 +119,7 @@ install_deps() {
             echo "  - libinput, libxkbcommon"
             echo "  - freetype2, pango, cairo, pixman"
             echo "  - libxcb, xcb-util-wm"
+            echo "  - grim, slurp, wl-clipboard (for screenshots)"
             echo "  - xwayland (optional, for X11 apps)"
             echo ""
             read -p "Continue anyway? [y/N] " -n 1 -r
