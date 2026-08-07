@@ -440,6 +440,15 @@ static void updatebar(Monitor *m);
 static void updatebars(void);
 static void updateappmenu(void);
 static int appmenu_item_count(void);
+static void updatenetmenu(void);
+static int netmenu_item_count(void);
+static void netmenu_refresh(void);
+static void netmenu_parse(void);
+static void netmenu_build_groups(void);
+static void netmenu_cancel_load(void);
+static int netmenu_read_cb(int fd, uint32_t mask, void *data);
+static void togglenetmenu(const Arg *arg);
+static int netmenukey(xkb_keysym_t sym);
 static int timingtimer(void *data);
 static int bartimer(void *data);
 static int scrolltimer(void *data);
@@ -505,7 +514,11 @@ static int launcher_active = 0;
 static char launcher_input[256] = {0};
 static int launcher_input_len = 0;
 static int launcher_selection = 0;
-static char **app_cache = NULL;
+typedef struct {
+	char cmd[256];  /* command to run (full path for flatpak exports) */
+	char name[64];  /* friendly display name; falls back to cmd basename */
+} AppCacheEntry;
+static AppCacheEntry *app_cache = NULL;
 static int app_cache_count = 0;
 
 /* ==================== COMPREHENSIVE PERFORMANCE TIMING ==================== */
@@ -649,7 +662,7 @@ static int any_title_needs_scroll = 0;   /* track if any title needs scrolling *
 static int scroll_only_bar_update = 0;   /* 1 = only update scrolling tabs, skip static */
 
 /* REPL state */
-static int repl_visible = 1;             /* 1 = REPL background/text visible */
+static int repl_visible = 0;             /* 0 = REPL background/text hidden unless active */
 static int repl_input_active = 0;        /* 1 = REPL accepting keyboard input */
 static char repl_input[1024] = {0};      /* current input line */
 static int repl_input_len = 0;
@@ -706,11 +719,59 @@ static uint32_t cfg_border_line_color = 0xaaaaaa;  /* grey box-drawing */
 static uint32_t cfg_menu_color = 0xaaaaaa;         /* grey menu background */
 static uint32_t cfg_menu_text_color = 0x000000;    /* black menu text */
 static char cfg_menu_button[16] = "X";             /* app menu button label */
+static char cfg_net_menu_button[16] = "N";         /* network menu button label */
 
 /* App menu state */
 static int appmenu_active = 0;
 static struct wlr_scene_buffer *appmenu_buffer = NULL;
 static struct TitleBuffer *appmenu_tb = NULL;  /* cached buffer for reuse */
+
+/* Network menu state (WiFi / Bluetooth) */
+#define MAX_NET_ENTRIES 128
+#define MAX_NET_CATEGORIES 16
+#define NET_NAME_LEN 128
+#define NET_EXEC_LEN 256
+#define NET_CAT_LEN 32
+typedef struct {
+	char category[NET_CAT_LEN];
+	char group[NET_CAT_LEN];
+	char name[NET_NAME_LEN];
+	char exec[NET_EXEC_LEN];
+	int needspass;  /* 1 = requires a password that tbwm must ask for */
+} NetEntry;
+static NetEntry net_entries[MAX_NET_ENTRIES];
+static int net_entry_count = 0;
+static char netmenu_cmd[512] = ""; /* command that lists entries (category<TAB>group<TAB>name<TAB>exec per line) */
+static int netmenu_active = 0;
+static struct wlr_scene_buffer *netmenu_buffer = NULL;
+static struct TitleBuffer *netmenu_tb = NULL;  /* cached buffer for reuse */
+static int net_scroll_offset = 0;
+static int net_selected_row = 0;
+static char net_categories[MAX_NET_CATEGORIES][NET_CAT_LEN];
+static int net_category_count = 0;
+static int net_current_category = -1;  /* -1 = showing categories, >=0 = showing sub-topics of that category */
+static char net_groups[MAX_NET_CATEGORIES][NET_CAT_LEN];
+static int net_group_count = 0;
+static int net_current_group = -1;  /* -1 = showing sub-topics, >=0 = showing entries of that sub-topic */
+
+/* In-menu password entry (for WiFi networks that need one) */
+static int net_password_mode = 0;
+static char net_password[128];
+static int net_password_len = 0;
+static char net_password_label[NET_NAME_LEN];  /* network name shown in the prompt */
+static char net_password_exec[NET_EXEC_LEN];   /* nmcli command, password is appended */
+static void net_password_reset(void);
+static void netmenu_run(NetEntry *e);
+static void netmenu_connect_with_password(void);
+
+/* Asynchronous netmenu data loader: the command runs in a forked child and
+ * its stdout is read through a non-blocking pipe in the Wayland event loop,
+ * so opening the menu never blocks the compositor. */
+static pid_t netmenu_child_pid = -1;
+static int netmenu_pipe_fd = -1;
+static struct wl_event_source *netmenu_source = NULL;
+static char netmenu_out[32768];
+static int netmenu_out_len = 0;
 
 /* App launcher data structures */
 #define MAX_APPS 512
@@ -1304,6 +1365,51 @@ buttonpress(struct wl_listener *listener, void *data)
 				toggleappmenu(&a);
 				return;
 			}
+
+			/* Network menu button [N] on the right, next to date/time */
+			{
+				int nbtn_len = strlen(cfg_net_menu_button);
+				int nbtn_cells = nbtn_len + 2; /* [nbtn] */
+				int right_chars;
+				time_t nnow = time(NULL);
+				struct tm *ntm = localtime(&nnow);
+
+				if (cfg_status_text[0] != '\0') {
+					right_chars = nbtn_cells + 3 + (int)strlen(cfg_status_text);
+				} else if (cfg_show_date || cfg_show_time) {
+					char n_date[32] = "", n_time[32] = "";
+					int n_dl = 0, n_tl = 0;
+					if (cfg_show_date) {
+						strftime(n_date, sizeof(n_date), "%Y-%m-%d", ntm);
+						n_dl = strlen(n_date);
+					}
+					if (cfg_show_time) {
+						strftime(n_time, sizeof(n_time), "%I:%M:%S %p", ntm);
+						n_tl = strlen(n_time);
+					}
+					if (cfg_show_date && cfg_show_time)
+						right_chars = nbtn_cells + 3 + n_dl + 3 + n_tl;
+					else if (cfg_show_date)
+						right_chars = nbtn_cells + 3 + n_dl;
+					else if (cfg_show_time)
+						right_chars = nbtn_cells + 3 + n_tl;
+					else
+						right_chars = nbtn_cells;
+				} else {
+					right_chars = nbtn_cells;
+				}
+
+				{
+					int right_start = selmon->m.width - right_chars * cell_width;
+					int net_start = right_start;
+					int net_end = net_start + nbtn_cells * cell_width;
+					if (bar_x >= net_start && bar_x < net_end) {
+						Arg a = {0};
+						togglenetmenu(&a);
+						return;
+					}
+				}
+			}
 		}
 
 		/* Handle app menu clicks */
@@ -1371,6 +1477,106 @@ buttonpress(struct wl_listener *listener, void *data)
 				/* Click outside menu - close it */
 				appmenu_active = 0;
 				updateappmenu();
+				updatebars();
+			}
+		}
+
+		/* Handle net menu clicks */
+		if (netmenu_active && selmon) {
+			int menu_x = selmon->m.x + selmon->m.width - 25 * cell_width;
+			int menu_y = selmon->m.y + cell_height;
+			int menu_w = 25 * cell_width;
+			int menu_h = 25 * cell_height;
+			
+			if (cursor->x >= menu_x && cursor->x < menu_x + menu_w &&
+			    cursor->y >= menu_y && cursor->y < menu_y + menu_h) {
+				/* Click is inside menu */
+				int rel_y = cursor->y - menu_y;
+				int clicked_row = rel_y / cell_height;
+
+				/* While entering a password, clicks inside the menu do nothing */
+				if (net_password_mode)
+					return; /* Consume the click */
+				
+				/* Row 0 is title bar, rows 1-23 are content, row 24 is bottom */
+				if (clicked_row >= 1 && clicked_row <= 23) {
+					int content_row = clicked_row - 1;
+					
+					if (net_current_category < 0) {
+						/* Clicked on a category */
+						int cat_idx = content_row + net_scroll_offset;
+						if (cat_idx < net_category_count) {
+							net_current_category = cat_idx;
+							net_current_group = -1;
+							net_scroll_offset = 0;
+							net_selected_row = 0;
+							netmenu_build_groups();
+							if (net_group_count == 0)
+								net_current_group = 0; /* show direct entries */
+							updatenetmenu();
+						}
+					} else if (net_current_group < 0) {
+						/* In sub-topics view */
+						if (content_row == 0) {
+							/* Clicked "Back" - to categories */
+							net_current_category = -1;
+							net_current_group = -1;
+							net_scroll_offset = 0;
+							net_selected_row = 0;
+							updatenetmenu();
+						} else {
+							/* Clicked on a sub-topic */
+							int target = content_row - 1; /* -1 for Back row */
+							if (target < net_group_count) {
+								net_current_group = target;
+								net_scroll_offset = 0;
+								net_selected_row = 0;
+								updatenetmenu();
+							}
+						}
+					} else {
+						/* In entries view */
+						if (content_row == 0) {
+							/* Clicked "Back" */
+							if (net_group_count > 0) {
+								net_current_group = -1;
+							} else {
+								net_current_category = -1;
+								net_current_group = -1;
+							}
+							net_scroll_offset = 0;
+							net_selected_row = 0;
+							updatenetmenu();
+						} else {
+							/* Clicked on an entry */
+							const char *cat = net_categories[net_current_category];
+							const char *group = (net_group_count == 0) ? "" : net_groups[net_current_group];
+							int e_idx = 0;
+							int display_row = 1;
+							int i;
+							
+							for (i = 0; i < net_entry_count; i++) {
+								if (strcmp(net_entries[i].category, cat) == 0 &&
+								    strcmp(net_entries[i].group, group) == 0) {
+									if (e_idx >= net_scroll_offset) {
+										if (display_row == content_row) {
+											/* Found the clicked entry - run it */
+											netmenu_run(&net_entries[i]);
+											return;
+										}
+										display_row++;
+									}
+									e_idx++;
+								}
+							}
+						}
+					}
+				}
+				return; /* Consume the click */
+			} else {
+				/* Click outside menu - close it */
+				netmenu_active = 0;
+				updatenetmenu();
 				updatebars();
 			}
 		}
@@ -1633,6 +1839,18 @@ cleanup(void)
 		appmenu_tb = NULL;
 	}
 
+	/* Clean up network menu buffer */
+	if (netmenu_buffer) {
+		wlr_scene_buffer_set_buffer(netmenu_buffer, NULL);
+	}
+	if (netmenu_tb) {
+		wlr_buffer_drop(&netmenu_tb->base);
+		netmenu_tb = NULL;
+	}
+	/* Clean up any in-flight network menu data load */
+	netmenu_cancel_load();
+	net_password_reset();
+
 	/* Clean up REPL buffers on all monitors */
 	wl_list_for_each(m, &mons, link) {
 		if (m->repl) {
@@ -1682,9 +1900,6 @@ cleanup(void)
 
 	/* Clean up app cache (launcher autocomplete) */
 	if (app_cache) {
-		for (i = 0; i < app_cache_count; i++) {
-			free(app_cache[i]);
-		}
 		free(app_cache);
 		app_cache = NULL;
 		app_cache_count = 0;
@@ -3191,9 +3406,10 @@ void
 handlesig(int signo)
 {
 	if (signo == SIGCHLD) {
-		/* Reap children (async-signal-safe) */
-		while (waitpid(-1, NULL, WNOHANG) > 0);
-		/* Wake main loop so it can handle reaping/logging */
+		/* Do NOT reap children here: reaping in the handler discards the PID,
+		 * so signal_fd_cb() can no longer match screenshot_pid and reset
+		 * screenshot_mode, leaving the compositor stuck in grab mode forever.
+		 * signal_fd_cb() performs the reaping and state reset in the main loop. */
 		if (signal_fd >= 0) {
 			uint64_t one = 1;
 			ssize_t s = write(signal_fd, &one, sizeof(one));
@@ -3367,11 +3583,23 @@ inputdevice(struct wl_listener *listener, void *data)
 }
 
 static int
+launcher_entry_matches(const AppCacheEntry *e)
+{
+	if (launcher_input_len == 0)
+		return 1;
+	if (strncasecmp(e->cmd, launcher_input, launcher_input_len) == 0)
+		return 1;
+	if (e->name[0] && strncasecmp(e->name, launcher_input, launcher_input_len) == 0)
+		return 1;
+	return 0;
+}
+
+static int
 launcher_match_count(void)
 {
 	int i, count = 0;
 	for (i = 0; i < app_cache_count; i++) {
-		if (strncmp(app_cache[i], launcher_input, launcher_input_len) == 0)
+		if (launcher_entry_matches(&app_cache[i]))
 			count++;
 	}
 	return count;
@@ -3382,9 +3610,9 @@ launcher_get_match(int index)
 {
 	int i, count = 0;
 	for (i = 0; i < app_cache_count; i++) {
-		if (strncmp(app_cache[i], launcher_input, launcher_input_len) == 0) {
+		if (launcher_entry_matches(&app_cache[i])) {
 			if (count == index)
-				return app_cache[i];
+				return app_cache[i].cmd;
 			count++;
 		}
 	}
@@ -3586,6 +3814,574 @@ appmenukey(xkb_keysym_t sym)
 }
 
 static int
+netmenu_item_count(void)
+{
+	if (net_current_category < 0) {
+		return net_category_count;
+	} else if (net_current_group < 0) {
+		/* Showing sub-topics of the category */
+		return net_group_count + 1; /* +1 for "< Back" */
+	} else {
+		/* Showing entries of a sub-topic */
+		const char *cat = net_categories[net_current_category];
+		const char *group = (net_group_count == 0) ? "" : net_groups[net_current_group];
+		int count = 1; /* "< Back" item */
+		int i;
+		for (i = 0; i < net_entry_count; i++) {
+			if (strcmp(net_entries[i].category, cat) == 0 &&
+			    strcmp(net_entries[i].group, group) == 0)
+				count++;
+		}
+		return count;
+	}
+}
+
+	/* Parse the accumulated netmenu command output into net_entries and
+	 * net_categories. Each line is "Category<TAB>Group<TAB>Name<TAB>exec[<TAB>needspass]". */
+static void
+netmenu_parse(void)
+{
+	char *p = netmenu_out;
+	int n = 0;
+
+	net_entry_count = 0;
+	net_category_count = 0;
+
+	netmenu_out[netmenu_out_len] = '\0';
+	while (n < MAX_NET_ENTRIES && *p) {
+		char *line;
+		char *tab1, *tab2, *tab3, *tab4;
+		char *cat, *group, *name, *exec;
+		int needspass = 0;
+		int ci;
+
+		line = p;
+		p = strchr(p, '\n');
+		if (p)
+			*p++ = '\0';
+
+		if (!line[0])
+			continue;
+
+		tab1 = strchr(line, '\t');
+		if (tab1) {
+			*tab1 = '\0';
+			cat = line;
+			tab2 = strchr(tab1 + 1, '\t');
+			if (tab2) {
+				*tab2 = '\0';
+				group = tab1 + 1;
+				tab3 = strchr(tab2 + 1, '\t');
+				if (tab3) {
+					*tab3 = '\0';
+					name = tab2 + 1;
+					exec = tab3 + 1;
+					tab4 = strchr(tab3 + 1, '\t');
+					if (tab4) {
+						*tab4 = '\0';
+						needspass = (tab4[1] == '1');
+					}
+				} else {
+					name = tab2 + 1;
+					exec = tab2 + 1;
+				}
+			} else {
+				group = "";
+				name = tab1 + 1;
+				exec = tab1 + 1;
+			}
+		} else {
+			cat = "Network";
+			group = "";
+			name = line;
+			exec = line;
+		}
+
+		strncpy(net_entries[n].category, cat, NET_CAT_LEN - 1);
+		net_entries[n].category[NET_CAT_LEN - 1] = '\0';
+		strncpy(net_entries[n].group, group, NET_CAT_LEN - 1);
+		net_entries[n].group[NET_CAT_LEN - 1] = '\0';
+		strncpy(net_entries[n].name, name, NET_NAME_LEN - 1);
+		net_entries[n].name[NET_NAME_LEN - 1] = '\0';
+		strncpy(net_entries[n].exec, exec, NET_EXEC_LEN - 1);
+		net_entries[n].exec[NET_EXEC_LEN - 1] = '\0';
+		net_entries[n].needspass = needspass;
+
+		/* Add category if new */
+		for (ci = 0; ci < net_category_count; ci++) {
+			if (strcmp(net_categories[ci], net_entries[n].category) == 0)
+				break;
+		}
+		if (ci >= net_category_count && net_category_count < MAX_NET_CATEGORIES) {
+			strncpy(net_categories[net_category_count], net_entries[n].category, NET_CAT_LEN - 1);
+			net_categories[net_category_count][NET_CAT_LEN - 1] = '\0';
+			net_category_count++;
+		}
+		n++;
+	}
+	net_entry_count = n;
+}
+
+/* Build the list of sub-topics (groups) for the currently selected category.
+ * Entries with an empty group are treated as direct entries of a single
+ * implicit group, so the group view is skipped. */
+static void
+netmenu_build_groups(void)
+{
+	int gi;
+	int i;
+
+	net_group_count = 0;
+	for (i = 0; i < net_entry_count; i++) {
+		if (net_current_category < 0 ||
+		    strcmp(net_entries[i].category, net_categories[net_current_category]) != 0)
+			continue;
+		if (net_entries[i].group[0] == '\0')
+			continue; /* direct entries: no sub-topic */
+		for (gi = 0; gi < net_group_count; gi++) {
+			if (strcmp(net_groups[gi], net_entries[i].group) == 0)
+				break;
+		}
+		if (gi >= net_group_count && net_group_count < MAX_NET_CATEGORIES) {
+			strncpy(net_groups[net_group_count], net_entries[i].group, NET_CAT_LEN - 1);
+			net_groups[net_group_count][NET_CAT_LEN - 1] = '\0';
+			net_group_count++;
+		}
+	}
+}
+
+/* Stop an in-flight asynchronous load: remove the event source, close the
+ * pipe and kill/reap the child. */
+static void
+netmenu_cancel_load(void)
+{
+	if (netmenu_source) {
+		wl_event_source_remove(netmenu_source);
+		netmenu_source = NULL;
+	}
+	if (netmenu_pipe_fd >= 0) {
+		close(netmenu_pipe_fd);
+		netmenu_pipe_fd = -1;
+	}
+	if (netmenu_child_pid > 0) {
+		kill(netmenu_child_pid, SIGTERM);
+		waitpid(netmenu_child_pid, NULL, WNOHANG);
+		netmenu_child_pid = -1;
+	}
+}
+
+/* Read netmenu command output as it arrives; finalize when the child closes
+ * the pipe (EOF). Never blocks the event loop. */
+static int
+netmenu_read_cb(int fd, uint32_t mask, void *data)
+{
+	char buf[4096];
+	ssize_t r;
+	int done = 0;
+
+	(void)mask;
+	(void)data;
+
+	while ((r = read(fd, buf, sizeof(buf))) > 0) {
+		if (netmenu_out_len + r < (int)sizeof(netmenu_out))
+			memcpy(netmenu_out + netmenu_out_len, buf, r);
+		netmenu_out_len += r;
+		if (netmenu_out_len >= (int)sizeof(netmenu_out)) {
+			netmenu_out_len = sizeof(netmenu_out) - 1;
+			done = 1;
+			break;
+		}
+	}
+	if (r == 0)
+		done = 1;
+
+	if (done) {
+		char saved_cat[NET_CAT_LEN] = "";
+		char saved_group[NET_CAT_LEN] = "";
+		int keep = 0;
+		int gi;
+		int i;
+
+		/* A reload invalidates any in-progress password entry */
+		net_password_reset();
+
+		/* Child finished */
+		if (netmenu_source) {
+			wl_event_source_remove(netmenu_source);
+			netmenu_source = NULL;
+		}
+		if (netmenu_pipe_fd >= 0) {
+			close(netmenu_pipe_fd);
+			netmenu_pipe_fd = -1;
+		}
+		if (netmenu_child_pid > 0) {
+			/* May already have been reaped by signal_fd_cb() */
+			waitpid(netmenu_child_pid, NULL, WNOHANG);
+			netmenu_child_pid = -1;
+		}
+		/* Remember where the user was so a background reload doesn't jump */
+		if (net_current_category >= 0 && net_current_category < net_category_count) {
+			strncpy(saved_cat, net_categories[net_current_category], NET_CAT_LEN - 1);
+			saved_cat[NET_CAT_LEN - 1] = '\0';
+			if (net_current_group >= 0 && net_current_group < net_group_count)
+				strncpy(saved_group, net_groups[net_current_group], NET_CAT_LEN - 1);
+			keep = 1;
+		}
+		netmenu_parse();
+		if (keep) {
+			net_current_category = -1;
+			for (i = 0; i < net_category_count; i++) {
+				if (strcmp(net_categories[i], saved_cat) == 0) {
+					net_current_category = i;
+					break;
+				}
+			}
+		}
+		netmenu_build_groups();
+		if (keep && net_current_category >= 0) {
+			net_current_group = -1;
+			for (gi = 0; gi < net_group_count; gi++) {
+				if (strcmp(net_groups[gi], saved_group) == 0) {
+					net_current_group = gi;
+					break;
+				}
+			}
+		}
+		if (netmenu_active)
+			updatenetmenu();
+	}
+	return 1;
+}
+
+/* Start an asynchronous load of the netmenu data. The command runs in a
+ * forked child; its stdout is read through a non-blocking pipe in the
+ * Wayland event loop, so this returns immediately. */
+static void
+netmenu_refresh(void)
+{
+	int p[2];
+	int flags;
+	pid_t pid;
+
+	netmenu_cancel_load();
+	netmenu_out_len = 0;
+	netmenu_out[0] = '\0';
+
+	if (netmenu_cmd[0] == '\0')
+		return;
+
+	if (pipe(p) < 0) {
+		tbwm_log(TBWM_LOG_WARN, "tbwm: netmenu: pipe() failed: %s\n", strerror(errno));
+		return;
+	}
+
+	flags = fcntl(p[0], F_GETFL, 0);
+	if (flags >= 0)
+		fcntl(p[0], F_SETFL, flags | O_NONBLOCK);
+
+	pid = fork();
+	if (pid < 0) {
+		tbwm_log(TBWM_LOG_WARN, "tbwm: netmenu: fork() failed: %s\n", strerror(errno));
+		close(p[0]);
+		close(p[1]);
+		return;
+	}
+	if (pid == 0) {
+		/* Child: run the command, send stdout (and stderr) down the pipe */
+		setsid();
+		close(p[0]);
+		dup2(p[1], STDOUT_FILENO);
+		dup2(p[1], STDERR_FILENO);
+		close(p[1]);
+		execl("/bin/sh", "/bin/sh", "-c", netmenu_cmd, (char *)NULL);
+		_exit(127);
+	}
+
+	/* Parent */
+	close(p[1]);
+	netmenu_pipe_fd = p[0];
+	netmenu_child_pid = pid;
+	netmenu_source = wl_event_loop_add_fd(wl_display_get_event_loop(dpy),
+		netmenu_pipe_fd, WL_EVENT_READABLE, netmenu_read_cb, NULL);
+	if (!netmenu_source) {
+		close(netmenu_pipe_fd);
+		netmenu_pipe_fd = -1;
+		netmenu_child_pid = -1;
+		kill(pid, SIGTERM);
+		waitpid(pid, NULL, WNOHANG);
+	}
+}
+
+static void
+togglenetmenu(const Arg *arg)
+{
+	netmenu_active = !netmenu_active;
+	if (netmenu_active) {
+		net_password_reset();
+		net_current_category = -1;
+		net_current_group = -1;
+		net_group_count = 0;
+		net_scroll_offset = 0;
+		net_selected_row = 0;
+		netmenu_refresh();
+	} else {
+		netmenu_cancel_load();
+		net_password_reset();
+	}
+	updatenetmenu();
+	updatebars();
+}
+
+static void
+net_password_reset(void)
+{
+	net_password_mode = 0;
+	net_password_len = 0;
+	net_password[0] = '\0';
+}
+
+/* Run an entry's command, or switch to password entry if it needs one. */
+static void
+netmenu_run(NetEntry *e)
+{
+	if (e->needspass) {
+		strncpy(net_password_exec, e->exec, NET_EXEC_LEN - 1);
+		net_password_exec[NET_EXEC_LEN - 1] = '\0';
+		strncpy(net_password_label, e->name, NET_NAME_LEN - 1);
+		net_password_label[NET_NAME_LEN - 1] = '\0';
+		net_password_mode = 1;
+		net_password_len = 0;
+		net_password[0] = '\0';
+		updatenetmenu();
+		return;
+	}
+	{
+		Arg a = { .v = (const char*[]){ "/bin/sh", "-c", e->exec, NULL } };
+		spawn(&a);
+	}
+	netmenu_active = 0;
+	updatenetmenu();
+	updatebars();
+}
+
+/* Build "nmcli dev wifi connect 'SSID' password 'escaped'" and run it. */
+static void
+netmenu_connect_with_password(void)
+{
+	char cmd[NET_EXEC_LEN + 280];
+	char esc[sizeof(net_password) * 4];
+	int i, j = 0;
+
+	for (i = 0; i < net_password_len && j < (int)sizeof(esc) - 4; i++) {
+		if (net_password[i] == '\'') {
+			esc[j++] = '\'';
+			esc[j++] = '\\';
+			esc[j++] = '\'';
+			esc[j++] = '\'';
+		} else {
+			esc[j++] = net_password[i];
+		}
+	}
+	esc[j] = '\0';
+	snprintf(cmd, sizeof(cmd), "%s password '%s'", net_password_exec, esc);
+	{
+		Arg a = { .v = (const char*[]){ "/bin/sh", "-c", cmd, NULL } };
+		spawn(&a);
+	}
+	net_password_reset();
+	netmenu_active = 0;
+	updatenetmenu();
+	updatebars();
+}
+
+static int
+netmenukey(xkb_keysym_t sym)
+{
+	int item_count;
+	int content_rows = 23; /* menu_cells_h - 2 */
+
+	/* Password entry mode: consume everything, only a few keys act */
+	if (net_password_mode) {
+		if (sym == XKB_KEY_Escape || sym == XKB_KEY_Left || sym == XKB_KEY_h) {
+			net_password_reset();
+			updatenetmenu();
+			return 1;
+		}
+		if (sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter) {
+			netmenu_connect_with_password();
+			return 1;
+		}
+		if (sym == XKB_KEY_BackSpace) {
+			if (net_password_len > 0) {
+				net_password[--net_password_len] = '\0';
+				updatenetmenu();
+			}
+			return 1;
+		}
+		if (sym >= 0x20 && sym <= 0x7e &&
+		    net_password_len < (int)sizeof(net_password) - 1) {
+			net_password[net_password_len++] = (char)sym;
+			net_password[net_password_len] = '\0';
+			updatenetmenu();
+		}
+		return 1;
+	}
+
+	item_count = netmenu_item_count();
+
+	if (sym == XKB_KEY_Escape) {
+		if (net_current_group >= 0) {
+			/* Back to sub-topics (or direct entries fall to categories) */
+			if (net_group_count > 0) {
+				net_current_group = -1;
+				net_scroll_offset = 0;
+				net_selected_row = 0;
+				updatenetmenu();
+			} else {
+				net_current_category = -1;
+				net_current_group = -1;
+				net_scroll_offset = 0;
+				net_selected_row = 0;
+				updatenetmenu();
+			}
+		} else if (net_current_category >= 0) {
+			/* Back to categories */
+			net_current_category = -1;
+			net_current_group = -1;
+			net_scroll_offset = 0;
+			net_selected_row = 0;
+			updatenetmenu();
+		} else {
+			/* Close menu */
+			netmenu_active = 0;
+			updatenetmenu();
+			updatebars();
+		}
+		return 1;
+	}
+
+	if (sym == XKB_KEY_Up || sym == XKB_KEY_k) {
+		if (net_selected_row > 0) {
+			net_selected_row--;
+		} else if (net_scroll_offset > 0) {
+			net_scroll_offset--;
+		}
+		updatenetmenu();
+		return 1;
+	}
+
+	if (sym == XKB_KEY_Down || sym == XKB_KEY_j) {
+		int max_row = (item_count < content_rows) ? item_count - 1 : content_rows - 1;
+		if (net_selected_row < max_row && net_selected_row + net_scroll_offset < item_count - 1) {
+			net_selected_row++;
+		} else if (net_selected_row + net_scroll_offset < item_count - 1) {
+			net_scroll_offset++;
+		}
+		updatenetmenu();
+		return 1;
+	}
+
+	if (sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter || sym == XKB_KEY_Right || sym == XKB_KEY_l) {
+		int selected_idx = net_selected_row + net_scroll_offset;
+
+		if (net_current_category < 0) {
+			/* Select a category */
+			if (selected_idx < net_category_count) {
+				net_current_category = selected_idx;
+				net_current_group = -1;
+				net_scroll_offset = 0;
+				net_selected_row = 0;
+				netmenu_build_groups();
+				if (net_group_count == 0)
+					net_current_group = 0; /* show direct entries */
+				updatenetmenu();
+			}
+		} else if (net_current_group < 0) {
+			/* Showing sub-topics */
+			if (selected_idx == 0) {
+				/* Back to categories */
+				net_current_category = -1;
+				net_current_group = -1;
+				net_scroll_offset = 0;
+				net_selected_row = 0;
+				updatenetmenu();
+			} else {
+				int target = selected_idx - 1; /* -1 for Back row */
+				if (target < net_group_count) {
+					net_current_group = target;
+					net_scroll_offset = 0;
+					net_selected_row = 0;
+					updatenetmenu();
+				}
+			}
+		} else {
+			/* Showing entries */
+			if (selected_idx == 0) {
+				/* Back to sub-topics */
+				if (net_group_count > 0) {
+					net_current_group = -1;
+					net_scroll_offset = 0;
+					net_selected_row = 0;
+					updatenetmenu();
+				} else {
+					net_current_category = -1;
+					net_current_group = -1;
+					net_scroll_offset = 0;
+					net_selected_row = 0;
+					updatenetmenu();
+				}
+			} else {
+				const char *cat = net_categories[net_current_category];
+				const char *group = (net_group_count == 0) ? "" : net_groups[net_current_group];
+				int e_idx = 0;
+				int target = selected_idx - 1; /* -1 for Back row */
+				int i;
+
+				for (i = 0; i < net_entry_count; i++) {
+					if (strcmp(net_entries[i].category, cat) == 0 &&
+					    strcmp(net_entries[i].group, group) == 0) {
+						if (e_idx == target) {
+							netmenu_run(&net_entries[i]);
+							return 1;
+						}
+						e_idx++;
+					}
+				}
+			}
+		}
+		return 1;
+	}
+
+	if (sym == XKB_KEY_Left || sym == XKB_KEY_h || sym == XKB_KEY_BackSpace) {
+		if (net_current_group >= 0) {
+			if (net_group_count > 0) {
+				net_current_group = -1;
+				net_scroll_offset = 0;
+				net_selected_row = 0;
+				updatenetmenu();
+			} else {
+				net_current_category = -1;
+				net_current_group = -1;
+				net_scroll_offset = 0;
+				net_selected_row = 0;
+				updatenetmenu();
+			}
+		} else if (net_current_category >= 0) {
+			/* Back to categories */
+			net_current_category = -1;
+			net_current_group = -1;
+			net_scroll_offset = 0;
+			net_selected_row = 0;
+			updatenetmenu();
+		}
+		return 1;
+	}
+
+	/* Don't consume unhandled keys - allows the toggle binding to work */
+	return 0;
+}
+
+static int
 launcherkey(xkb_keysym_t sym)
 {
 	int match_count;
@@ -3671,6 +4467,8 @@ keybinding(uint32_t mods, xkb_keysym_t sym)
 	/* Handle app menu navigation - if appmenukey handles it, return 1;
 	 * otherwise fall through to check scheme bindings (e.g., M-x to toggle) */
 	if (appmenu_active && appmenukey(sym))
+		return 1;
+	if (netmenu_active && netmenukey(sym))
 		return 1;
 
 	/*
@@ -5530,6 +6328,7 @@ static s7_pointer scm_help(s7_scheme *sc, s7_pointer args)
 	repl_add_line("(tag-window N)     - move window to tag N");
 	repl_add_line("(reload-config)    - reload config.scm");
 	repl_add_line("(bind-key K F)     - bind key to function");
+	repl_add_line("(toggle-net-menu)  - open WiFi/Bluetooth menu");
 	repl_add_line("=== Appearance ===");
 	repl_add_line("(set-background-color C) - highlight/bg color");
 	repl_add_line("(set-border-line-color C)- box-drawing color");
@@ -5846,11 +6645,34 @@ static s7_pointer scm_toggle_appmenu(s7_scheme *sc, s7_pointer args) {
 	return s7_t(sc);
 }
 
+/* Scheme: (set-net-menu-cmd "cmd") - set the command that lists network menu entries */
+static s7_pointer scm_set_net_menu_cmd(s7_scheme *sc, s7_pointer args) {
+	if (!s7_is_string(s7_car(args))) return s7_f(sc);
+	strncpy(netmenu_cmd, s7_string(s7_car(args)), sizeof(netmenu_cmd) - 1);
+	netmenu_cmd[sizeof(netmenu_cmd) - 1] = '\0';
+	return s7_t(sc);
+}
+
+/* Scheme: (toggle-net-menu) - toggle the network (WiFi/Bluetooth) menu */
+static s7_pointer scm_toggle_net_menu(s7_scheme *sc, s7_pointer args) {
+	togglenetmenu(NULL);
+	return s7_t(sc);
+}
+
 /* Scheme: (set-menu-button "text") - set the app menu button label */
 static s7_pointer scm_set_menu_button(s7_scheme *sc, s7_pointer args) {
 	if (!s7_is_string(s7_car(args))) return s7_f(sc);
 	strncpy(cfg_menu_button, s7_string(s7_car(args)), sizeof(cfg_menu_button) - 1);
 	cfg_menu_button[sizeof(cfg_menu_button) - 1] = '\0';
+	updatebars();
+	return s7_t(sc);
+}
+
+/* Scheme: (set-net-menu-button "text") - set the network menu button label */
+static s7_pointer scm_set_net_menu_button(s7_scheme *sc, s7_pointer args) {
+	if (!s7_is_string(s7_car(args))) return s7_f(sc);
+	strncpy(cfg_net_menu_button, s7_string(s7_car(args)), sizeof(cfg_net_menu_button) - 1);
+	cfg_net_menu_button[sizeof(cfg_net_menu_button) - 1] = '\0';
 	updatebars();
 	return s7_t(sc);
 }
@@ -6209,7 +7031,10 @@ setup_scheme(void)
 	s7_define_function(sc, "set-menu-color", scm_set_menu_color, 1, 0, false, "(set-menu-color \"#RRGGBB\") set app menu background color");
 	s7_define_function(sc, "set-menu-text-color", scm_set_menu_text_color, 1, 0, false, "(set-menu-text-color \"#RRGGBB\") set app menu text color");
 	s7_define_function(sc, "set-menu-button", scm_set_menu_button, 1, 0, false, "(set-menu-button \"text\") set app menu button label in bar");
+	s7_define_function(sc, "set-net-menu-button", scm_set_net_menu_button, 1, 0, false, "(set-net-menu-button \"text\") set network menu button label in bar");
 	s7_define_function(sc, "toggle-appmenu", scm_toggle_appmenu, 0, 0, false, "(toggle-appmenu) toggle the app menu visibility");
+	s7_define_function(sc, "set-net-menu-cmd", scm_set_net_menu_cmd, 1, 0, false, "(set-net-menu-cmd \"cmd\") set command that lists network menu entries");
+	s7_define_function(sc, "toggle-net-menu", scm_toggle_net_menu, 0, 0, false, "(toggle-net-menu) toggle the network (WiFi/Bluetooth) menu");
 	s7_define_function(sc, "set-tag-count", scm_set_tag_count, 1, 0, false, "(set-tag-count n) set number of virtual desktops (1-9)");
 	s7_define_function(sc, "set-show-time", scm_set_show_time, 1, 0, false, "(set-show-time b) show/hide time in status bar");
 	s7_define_function(sc, "set-show-date", scm_set_show_date, 1, 0, false, "(set-show-date b) show/hide date in status bar");
@@ -6416,62 +7241,7 @@ static const char *default_config_parts[] = {
 "(bind-key \"C-A-F11\" (lambda () (chvt 11)))\n"
 "(bind-key \"C-A-F12\" (lambda () (chvt 12)))\n"
 "\n"
-";;; === Complete Scheme binding examples ===\n"
-";; Control and window management\n"
-"(bind-key \"M-Return\" (lambda () (spawn \"foot\")))\n"
-"(bind-key \"M-d\" (lambda () (toggle-launcher)))\n"
-"(bind-key \"M-x\" (lambda () (toggle-appmenu)))\n"
-"(bind-key \"M-q\" (lambda () (kill-client)))\n"
-"(bind-key \"M-S-e\" (lambda () (quit)))\n"
-"\n"
-";; Focus (vim & arrows)\n"
-"(bind-key \"M-h\" (lambda () (focus-dir DIR-LEFT)))\n"
-"(bind-key \"M-j\" (lambda () (focus-dir DIR-DOWN)))\n"
-"(bind-key \"M-k\" (lambda () (focus-dir DIR-UP)))\n"
-"(bind-key \"M-l\" (lambda () (focus-dir DIR-RIGHT)))\n"
-"(bind-key \"M-Left\" (lambda () (focus-dir DIR-LEFT)))\n"
-"(bind-key \"M-Down\" (lambda () (focus-dir DIR-DOWN)))\n"
-"(bind-key \"M-Up\" (lambda () (focus-dir DIR-UP)))\n"
-"(bind-key \"M-Right\" (lambda () (focus-dir DIR-RIGHT)))\n"
-"\n"
-";; Swap windows (vim & arrows)\n"
-"(bind-key \"M-S-h\" (lambda () (swap-dir DIR-LEFT)))\n"
-"(bind-key \"M-S-j\" (lambda () (swap-dir DIR-DOWN)))\n"
-"(bind-key \"M-S-k\" (lambda () (swap-dir DIR-UP)))\n"
-"(bind-key \"M-S-l\" (lambda () (swap-dir DIR-RIGHT)))\n"
-"(bind-key \"M-S-Left\" (lambda () (swap-dir DIR-LEFT)))\n"
-"(bind-key \"M-S-Down\" (lambda () (swap-dir DIR-DOWN)))\n"
-"(bind-key \"M-S-Up\" (lambda () (swap-dir DIR-UP)))\n"
-"(bind-key \"M-S-Right\" (lambda () (swap-dir DIR-RIGHT)))\n"
-"\n"
-";; Move/Resize with mouse or keyboard examples\n"
-"(bind-mouse \"M-button1\" (lambda () (move-window)))\n"
-"(bind-mouse \"M-button3\" (lambda () (resize-window)))\n"
-"(bind-key \"M-S-m\" (lambda () (move-window))) ; example keybinding\n"
-"(bind-key \"M-S-r\" (lambda () (resize-window))) ; example keybinding\n"
-"\n"
-";; Layouts & master area\n"
-"(bind-key \"M-f\" (lambda () (set-layout \"float\")))\n"
-"(bind-key \"M-S-\" (lambda () (cycle-layout))) ; use a key you like\n"
-"(bind-key \"M-h\" (lambda () (inc-mfact -0.05))) ; shrink master (example)\n"
-"(bind-key \"M-l\" (lambda () (inc-mfact 0.05))) ; grow master (example)\n"
-"(bind-key \"M-0\" (lambda () (view-all))) ; view all\n"
-"\n"
-";; Tagging\n"
-"(bind-key \"M-1\" (lambda () (view-tag 1)))\n"
-"(bind-key \"M-S-exclam\" (lambda () (tag-window 1))) ; move to tag 1\n"
-"\n"
-";; REPL & reload\n"
-"(bind-key \"M-S-colon\" (lambda () (toggle-repl)))\n"
-"(bind-key \"M-S-c\" (lambda () (reload-config)))\n"
-"(bind-key \"M-S-r\" (lambda () (refresh)))\n"
-"(bind-key \"M-;\" (lambda () (set-repl-log-level 1))) ; example to set repl log level to INFO\n"
-"\n"
-";; Misc: toggle fullscreen/floating, kill, help\n"
-"(bind-key \"M-f\" (lambda () (toggle-fullscreen)))\n"
-"(bind-key \"M-S-space\" (lambda () (toggle-floating)))\n"
-"(bind-key \"M-k\" (lambda () (kill-client)))\n"
-"(bind-key \"M-h\" (lambda () (help))) ; show help in REPL\n"
+";;; Complete Scheme binding examples removed (duplicated bindings above broke focus keys)\n"
 "\n"
 ";; Advanced setters (examples - not necessarily key bound):\n"
 ";; (set-border-width 2)\n"
@@ -6664,69 +7434,151 @@ setup_foot_config(void)
 static int
 app_compare(const void *a, const void *b)
 {
-	return strcmp(*(const char **)a, *(const char **)b);
+	return strcmp(((const AppCacheEntry *)a)->cmd, ((const AppCacheEntry *)b)->cmd);
+}
+
+/* Basename of a command (after the last '/') */
+static const char *
+cmd_basename(const char *cmd)
+{
+	const char *s = strrchr(cmd, '/');
+	return s ? s + 1 : cmd;
+}
+
+/* Extract the first Name= from the [Desktop Entry] section of a .desktop file */
+static void
+desktop_name_from(const char *desktop_path, char *out, size_t out_sz)
+{
+	FILE *f;
+	char line[512];
+	int in_entry = 0;
+
+	out[0] = '\0';
+	f = fopen(desktop_path, "r");
+	if (!f)
+		return;
+	while (fgets(line, sizeof(line), f)) {
+		line[strcspn(line, "\n")] = 0;
+		if (strcmp(line, "[Desktop Entry]") == 0) {
+			in_entry = 1;
+			continue;
+		}
+		if (line[0] == '[') {
+			in_entry = 0;
+			continue;
+		}
+		if (!in_entry)
+			continue;
+		if (strncmp(line, "Name=", 5) == 0) {
+			strncpy(out, line + 5, out_sz - 1);
+			out[out_sz - 1] = '\0';
+			break;
+		}
+	}
+	fclose(f);
+}
+
+static void
+add_bin_dir_to_app_cache(const char *dir, int *capacity, const char *desktop_dir)
+{
+	DIR *d;
+	struct dirent *ent;
+	int i, dup;
+	AppCacheEntry *e;
+
+	d = opendir(dir);
+	if (!d)
+		return;
+
+	while ((ent = readdir(d))) {
+		if (ent->d_name[0] == '.')
+			continue;
+		/* Check for duplicates (by basename of the command) */
+		dup = 0;
+		for (i = 0; i < app_cache_count; i++) {
+			if (strcmp(ent->d_name, cmd_basename(app_cache[i].cmd)) == 0) {
+				dup = 1;
+				break;
+			}
+		}
+		if (dup)
+			continue;
+		if (app_cache_count >= *capacity) {
+			size_t new_capacity = *capacity * 2;
+			AppCacheEntry *tmp = realloc(app_cache, new_capacity * sizeof(AppCacheEntry));
+			if (!tmp) {
+				tbwm_log(TBWM_LOG_WARN, "tbwm: warning: cannot grow app cache to %zu entries: %s\n", new_capacity, strerror(errno));
+				/* stop adding further entries to avoid inconsistent state */
+				break;
+			}
+			app_cache = tmp;
+			*capacity = (int)new_capacity;
+		}
+
+		e = &app_cache[app_cache_count];
+		/* Use full path for explicit export dirs so the binary runs even if
+		 * that dir is not in PATH. */
+		if (desktop_dir) {
+			int n = snprintf(e->cmd, sizeof(e->cmd), "%s/", dir);
+			if (n > 0 && (size_t)n < sizeof(e->cmd))
+				snprintf(e->cmd + n, sizeof(e->cmd) - (size_t)n, "%s", ent->d_name);
+		} else {
+			snprintf(e->cmd, sizeof(e->cmd), "%s", ent->d_name);
+		}
+
+		/* Friendly name from the sibling .desktop file (flatpak exports) */
+		e->name[0] = '\0';
+		if (desktop_dir) {
+			char dp[512];
+			snprintf(dp, sizeof(dp), "%s/%s.desktop", desktop_dir, ent->d_name);
+			desktop_name_from(dp, e->name, sizeof(e->name));
+		}
+		if (!e->name[0])
+			snprintf(e->name, sizeof(e->name), "%.63s", ent->d_name);
+
+		app_cache_count++;
+	}
+	closedir(d);
 }
 
 void
 buildappcache(void)
 {
 	char *path, *path_copy, *dir;
-	DIR *d;
-	struct dirent *ent;
 	int capacity = 256;
-	int i, j, dup;
 
-	if (app_cache) {
-		for (i = 0; i < app_cache_count; i++)
-			free(app_cache[i]);
+	if (app_cache)
 		free(app_cache);
-	}
 
-	app_cache = ecalloc(capacity, sizeof(char *));
+	app_cache = ecalloc(capacity, sizeof(AppCacheEntry));
 	app_cache_count = 0;
 
-	path = getenv("PATH");
-	if (!path)
-		return;
-
-	path_copy = strdup(path);
-	dir = strtok(path_copy, ":");
-	while (dir) {
-		d = opendir(dir);
-		if (d) {
-			while ((ent = readdir(d))) {
-				if (ent->d_name[0] == '.')
-					continue;
-				/* Check for duplicates */
-				dup = 0;
-				for (j = 0; j < app_cache_count; j++) {
-					if (strcmp(app_cache[j], ent->d_name) == 0) {
-						dup = 1;
-						break;
-					}
-				}
-				if (dup)
-					continue;
-				if (app_cache_count >= capacity) {
-					size_t new_capacity = capacity * 2;
-					char **tmp = realloc(app_cache, new_capacity * sizeof(char *));
-					if (!tmp) {
-						 tbwm_log(TBWM_LOG_WARN, "tbwm: warning: cannot grow app cache to %zu entries: %s\n", new_capacity, strerror(errno));
-						/* stop adding further entries to avoid inconsistent state */
-						break;
-					}
-					app_cache = tmp;
-					capacity = new_capacity;
-				}
-				app_cache[app_cache_count++] = strdup(ent->d_name);
-			}
-			closedir(d);
+	/* Scan flatpak export dirs first so their full-path commands and friendly
+	 * names win over the bare PATH entries for the same binaries. */
+	add_bin_dir_to_app_cache("/var/lib/flatpak/exports/bin", &capacity, "/var/lib/flatpak/exports/share/applications");
+	add_bin_dir_to_app_cache("/usr/share/flatpak/exports/bin", &capacity, "/usr/share/flatpak/exports/share/applications");
+	{
+		const char *home = getenv("HOME");
+		char ubin[256], udesk[256];
+		if (home) {
+			snprintf(ubin, sizeof(ubin), "%s/.local/share/flatpak/exports/bin", home);
+			snprintf(udesk, sizeof(udesk), "%s/.local/share/flatpak/exports/share/applications", home);
+			add_bin_dir_to_app_cache(ubin, &capacity, udesk);
 		}
-		dir = strtok(NULL, ":");
 	}
-	free(path_copy);
 
-	qsort(app_cache, app_cache_count, sizeof(char *), app_compare);
+	path = getenv("PATH");
+	if (path) {
+		path_copy = strdup(path);
+		dir = strtok(path_copy, ":");
+		while (dir) {
+			add_bin_dir_to_app_cache(dir, &capacity, NULL);
+			dir = strtok(NULL, ":");
+		}
+		free(path_copy);
+	}
+
+	qsort(app_cache, app_cache_count, sizeof(AppCacheEntry), app_compare);
 	tbwm_log(TBWM_LOG_INFO, "Built app cache: %d entries", app_cache_count);
 }
 
@@ -6891,6 +7743,7 @@ void
 togglerepl(const Arg *arg)
 {
 	repl_input_active = !repl_input_active;
+	repl_visible = repl_input_active;
 	repl_input[0] = '\0';
 	repl_input_len = 0;
 	updatebars();
@@ -7068,11 +7921,19 @@ load_applications(void)
 	/* Scan system applications */
 	scan_desktop_dir("/usr/share/applications");
 	scan_desktop_dir("/usr/local/share/applications");
+
+	/* Scan flatpak exports (system-wide) so flatpak apps appear in the app menu */
+	scan_desktop_dir("/var/lib/flatpak/exports/share/applications");
+	scan_desktop_dir("/usr/share/flatpak/exports/share/applications");
 	
 	/* Scan user applications */
 	home = getenv("HOME");
 	if (home) {
 		snprintf(local_apps, sizeof(local_apps), "%s/.local/share/applications", home);
+		scan_desktop_dir(local_apps);
+
+		/* Flatpak apps installed per-user */
+		snprintf(local_apps, sizeof(local_apps), "%s/.local/share/flatpak/exports/share/applications", home);
 		scan_desktop_dir(local_apps);
 	}
 	
@@ -7315,6 +8176,336 @@ updateappmenu(void)
 	/* Don't drop - we're caching the buffer for reuse */
 }
 
+/* Network menu (WiFi / Bluetooth): a flat text list fed by netmenu_cmd */
+static void
+updatenetmenu(void)
+{
+	struct TitleBuffer *tb;
+	uint32_t *pixels;
+	int menu_cells_w = 25;
+	int menu_cells_h = 25;
+	int menu_width = menu_cells_w * cell_width;
+	int menu_height = menu_cells_h * cell_height;
+	int i, x, y, row, col;
+	uint32_t frame_bg = RGB_TO_ARGB(cfg_border_color);
+	uint32_t line_color = RGB_TO_ARGB(cfg_border_line_color);
+	uint32_t content_bg = RGB_TO_ARGB(cfg_menu_color);
+	uint32_t text_color = RGB_TO_ARGB(cfg_menu_text_color);
+	uint32_t highlight_bg = RGB_TO_ARGB(cfg_border_color);
+	uint32_t highlight_fg = RGB_TO_ARGB(cfg_border_line_color);
+
+	if (!netmenu_active) {
+		if (netmenu_buffer)
+			wlr_scene_node_set_enabled(&netmenu_buffer->node, 0);
+		return;
+	}
+
+	/* Reuse cached buffer or allocate new one */
+	if (!netmenu_tb) {
+		netmenu_tb = ecalloc(1, sizeof(*netmenu_tb));
+		netmenu_tb->stride = menu_width * 4;
+		netmenu_tb->data = ecalloc(1, netmenu_tb->stride * menu_height);
+		wlr_buffer_init(&netmenu_tb->base, &titlebuf_impl, menu_width, menu_height);
+		titlebuf_alloc_count++;
+	}
+	tb = netmenu_tb;
+	pixels = tb->data;
+
+	/* Fill entire background with content color first */
+	for (i = 0; i < menu_width * menu_height; i++) {
+		pixels[i] = content_bg;
+	}
+
+	/* Draw frame background for border cells */
+	for (y = 0; y < cell_height; y++) {
+		for (x = 0; x < menu_width; x++) {
+			pixels[y * menu_width + x] = frame_bg;
+		}
+	}
+	for (y = (menu_cells_h - 1) * cell_height; y < menu_height; y++) {
+		for (x = 0; x < menu_width; x++) {
+			pixels[y * menu_width + x] = frame_bg;
+		}
+	}
+	for (y = 0; y < menu_height; y++) {
+		for (x = 0; x < cell_width; x++) {
+			pixels[y * menu_width + x] = frame_bg;
+		}
+	}
+	for (y = 0; y < menu_height; y++) {
+		for (x = (menu_cells_w - 1) * cell_width; x < menu_width; x++) {
+			pixels[y * menu_width + x] = frame_bg;
+		}
+	}
+
+	/* Draw box-drawing characters for the frame */
+	render_char_to_buffer(pixels, menu_width, menu_height, 0, 0, 0x2554, line_color);
+	render_char_to_buffer(pixels, menu_width, menu_height, (menu_cells_w - 1) * cell_width, 0, 0x2557, line_color);
+	render_char_to_buffer(pixels, menu_width, menu_height, 0, (menu_cells_h - 1) * cell_height, 0x255A, line_color);
+	render_char_to_buffer(pixels, menu_width, menu_height, (menu_cells_w - 1) * cell_width, (menu_cells_h - 1) * cell_height, 0x255D, line_color);
+
+	/* Top edge with title */
+	{
+		const char *title = "Network";
+		int title_len = strlen(title);
+		int title_start = 2;
+		for (col = 1; col < menu_cells_w - 1; col++) {
+			if (col >= title_start && col < title_start + title_len) {
+				render_char_to_buffer(pixels, menu_width, menu_height, col * cell_width, 0, title[col - title_start], line_color);
+			} else {
+				render_char_to_buffer(pixels, menu_width, menu_height, col * cell_width, 0, 0x2550, line_color);
+			}
+		}
+	}
+	/* Bottom edge */
+	for (col = 1; col < menu_cells_w - 1; col++) {
+		render_char_to_buffer(pixels, menu_width, menu_height, col * cell_width, (menu_cells_h - 1) * cell_height, 0x2550, line_color);
+	}
+	/* Left edge */
+	for (row = 1; row < menu_cells_h - 1; row++) {
+		render_char_to_buffer(pixels, menu_width, menu_height, 0, row * cell_height, 0x2551, line_color);
+	}
+	/* Right edge */
+	for (row = 1; row < menu_cells_h - 1; row++) {
+		render_char_to_buffer(pixels, menu_width, menu_height, (menu_cells_w - 1) * cell_width, row * cell_height, 0x2551, line_color);
+	}
+
+	/* Password entry view */
+	if (net_password_mode) {
+		int mtext = menu_cells_w - 2;
+		int row_y;
+		const char *prompt = "Password for ";
+		const char *label = net_password_label;
+		const char *hint = "<Enter> conectar   <Esc> cancelar";
+		int pi;
+
+		/* Strip a leading "[WiFi] " / "[BT] " style prefix from the label */
+		{
+			const char *rb = strchr(label, ']');
+			if (rb) {
+				label = rb + 1;
+				while (*label == ' ')
+					label++;
+			}
+		}
+
+		/* Row 1: "Password for <label>:" */
+		row_y = cell_height;
+		{
+			int col = 0;
+			for (pi = 0; prompt[pi] && col < mtext; pi++)
+				render_char_to_buffer(pixels, menu_width, menu_height,
+					cell_width + col++ * cell_width, row_y, prompt[pi], text_color);
+			for (pi = 0; label[pi] && col < mtext; pi++)
+				render_char_to_buffer(pixels, menu_width, menu_height,
+					cell_width + col++ * cell_width, row_y, label[pi], text_color);
+			if (col < mtext)
+				render_char_to_buffer(pixels, menu_width, menu_height,
+					cell_width + col * cell_width, row_y, ':', text_color);
+		}
+
+		/* Row 2: masked password field, highlighted */
+		row_y = 2 * cell_height;
+		{
+			int px, py;
+			for (py = row_y; py < row_y + cell_height; py++) {
+				for (px = cell_width; px < menu_width - cell_width; px++) {
+					pixels[py * menu_width + px] = highlight_bg;
+				}
+			}
+			for (pi = 0; pi < net_password_len && pi < mtext; pi++) {
+				render_char_to_buffer(pixels, menu_width, menu_height,
+					cell_width + pi * cell_width, row_y, '*', highlight_fg);
+			}
+		}
+
+		/* Row 3: hint */
+		row_y = 3 * cell_height;
+		for (pi = 0; hint[pi] && pi < mtext; pi++) {
+			render_char_to_buffer(pixels, menu_width, menu_height,
+				cell_width + pi * cell_width, row_y, hint[pi], text_color);
+		}
+	} else {
+	/* Draw content: categories, sub-topics or entries */
+	{
+		int crows = menu_cells_h - 2;
+		int mtext = menu_cells_w - 2;
+
+		if (net_current_category < 0) {
+			/* Show categories */
+			if (net_category_count == 0 && netmenu_child_pid > 0) {
+				/* Data still loading on first open */
+				const char *loading = "Loading...";
+				int li;
+				for (li = 0; loading[li] && li < mtext; li++) {
+					render_char_to_buffer(pixels, menu_width, menu_height,
+						cell_width + li * cell_width, cell_height,
+						loading[li], text_color);
+				}
+			}
+			for (row = 0; row < crows && row + net_scroll_offset < net_category_count; row++) {
+				int item_idx = row + net_scroll_offset;
+				int text_y = (row + 1) * cell_height;
+				int is_selected = (row == net_selected_row);
+				uint32_t row_fg = is_selected ? highlight_fg : text_color;
+				const char *cat_name = net_categories[item_idx];
+				int ci;
+
+				if (is_selected) {
+					int px, py;
+					for (py = text_y; py < text_y + cell_height; py++) {
+						for (px = cell_width; px < menu_width - cell_width; px++) {
+							pixels[py * menu_width + px] = highlight_bg;
+						}
+					}
+				}
+
+				for (ci = 0; cat_name[ci] && ci < mtext; ci++) {
+					render_char_to_buffer(pixels, menu_width, menu_height,
+						cell_width + ci * cell_width, text_y,
+						cat_name[ci], row_fg);
+				}
+			}
+		} else if (net_current_group < 0) {
+			/* Show sub-topics of the selected category */
+			int gi;
+			int displayed = 0;
+			int is_selected;
+			uint32_t row_fg;
+
+			/* First row: "< Back" */
+			is_selected = (net_selected_row == 0);
+			row_fg = is_selected ? highlight_fg : text_color;
+			{
+				int text_y = cell_height;
+				const char *back = "< Back";
+				int bi;
+
+				if (is_selected) {
+					int px, py;
+					for (py = text_y; py < text_y + cell_height; py++) {
+						for (px = cell_width; px < menu_width - cell_width; px++) {
+							pixels[py * menu_width + px] = highlight_bg;
+						}
+					}
+				}
+
+				for (bi = 0; back[bi] && bi < mtext; bi++) {
+					render_char_to_buffer(pixels, menu_width, menu_height,
+						cell_width + bi * cell_width, text_y,
+						back[bi], row_fg);
+				}
+			}
+
+			/* Show the sub-topics */
+			for (gi = 0; gi < net_group_count && displayed < crows - 1; gi++) {
+				if (gi >= net_scroll_offset) {
+					int text_y = (displayed + 2) * cell_height;
+					const char *gn = net_groups[gi];
+					int ni2;
+
+					is_selected = (displayed + 1 == net_selected_row);
+					row_fg = is_selected ? highlight_fg : text_color;
+
+					if (is_selected) {
+						int px, py;
+						for (py = text_y; py < text_y + cell_height; py++) {
+							for (px = cell_width; px < menu_width - cell_width; px++) {
+								pixels[py * menu_width + px] = highlight_bg;
+							}
+						}
+					}
+
+					for (ni2 = 0; gn[ni2] && ni2 < mtext; ni2++) {
+						render_char_to_buffer(pixels, menu_width, menu_height,
+							cell_width + ni2 * cell_width, text_y,
+							(unsigned char)gn[ni2], row_fg);
+					}
+					displayed++;
+				}
+			}
+		} else {
+			/* Show entries of the selected sub-topic */
+			const char *cat = net_categories[net_current_category];
+			const char *group = (net_group_count == 0) ? "" : net_groups[net_current_group];
+			int e_idx = 0;
+			int displayed = 0;
+			int is_selected;
+			uint32_t row_fg;
+
+			/* First row: "< Back" */
+			is_selected = (net_selected_row == 0);
+			row_fg = is_selected ? highlight_fg : text_color;
+			{
+				int text_y = cell_height;
+				const char *back = "< Back";
+				int bi;
+
+				if (is_selected) {
+					int px, py;
+					for (py = text_y; py < text_y + cell_height; py++) {
+						for (px = cell_width; px < menu_width - cell_width; px++) {
+							pixels[py * menu_width + px] = highlight_bg;
+						}
+					}
+				}
+
+				for (bi = 0; back[bi] && bi < mtext; bi++) {
+					render_char_to_buffer(pixels, menu_width, menu_height,
+						cell_width + bi * cell_width, text_y,
+						back[bi], row_fg);
+				}
+			}
+
+			/* Show entries in this sub-topic */
+			for (i = 0; i < net_entry_count && displayed < crows - 1; i++) {
+				if (strcmp(net_entries[i].category, cat) == 0 &&
+				    strcmp(net_entries[i].group, group) == 0) {
+					if (e_idx >= net_scroll_offset) {
+						int text_y = (displayed + 2) * cell_height;
+						const char *nm = net_entries[i].name;
+						int ni;
+
+						is_selected = (displayed + 1 == net_selected_row);
+						row_fg = is_selected ? highlight_fg : text_color;
+
+						if (is_selected) {
+							int px, py;
+							for (py = text_y; py < text_y + cell_height; py++) {
+								for (px = cell_width; px < menu_width - cell_width; px++) {
+									pixels[py * menu_width + px] = highlight_bg;
+								}
+							}
+						}
+
+						for (ni = 0; nm[ni] && ni < mtext; ni++) {
+							render_char_to_buffer(pixels, menu_width, menu_height,
+								cell_width + ni * cell_width, text_y,
+								(unsigned char)nm[ni], row_fg);
+						}
+						displayed++;
+					}
+					e_idx++;
+				}
+			}
+		}
+	}
+	} /* else: password view */
+
+	/* Create or update the netmenu buffer */
+	if (!netmenu_buffer)
+		netmenu_buffer = wlr_scene_buffer_create(layers[LyrTop], NULL);
+	wlr_scene_node_set_enabled(&netmenu_buffer->node, 1);
+	/* Position at top-right of focused monitor, below the bar */
+	if (selmon) {
+		wlr_scene_node_set_position(&netmenu_buffer->node, selmon->m.x + selmon->m.width - menu_width, selmon->m.y + cell_height);
+	} else {
+		wlr_scene_node_set_position(&netmenu_buffer->node, sgeom.x + sgeom.width - menu_width, sgeom.y + cell_height);
+	}
+	wlr_scene_buffer_set_buffer(netmenu_buffer, &tb->base);
+	/* Don't drop - we're caching the buffer for reuse */
+}
+
 /* Key helper: reload configuration (wrapper so we can bind it in C defaults) */
 void
 reload_config_key(const Arg *arg)
@@ -7412,9 +8603,11 @@ replkey(xkb_keysym_t sym)
 {
 	if (sym == XKB_KEY_Escape) {
 		repl_input_active = 0;
+		repl_visible = 0;
 		repl_input[0] = '\0';
 		repl_input_len = 0;
 		updatebars();
+		updaterepl();
 		return 1;
 	}
 
@@ -7643,37 +8836,37 @@ updatebar(Monitor *m)
 		if (launcher_input_len > 0) {
 			shown = 0;
 			for (i = 0; i < app_cache_count && x < width - cell_width; i++) {
-				/* Prefix match */
-				if (strncmp(app_cache[i], launcher_input, launcher_input_len) == 0) {
-					len = strlen(app_cache[i]);
-					fits = (x + (len + 3) * cell_width) <= width;
-					if (!fits && shown > 0)
-						break;
+				/* Prefix match on command or friendly name */
+				if (!launcher_entry_matches(&app_cache[i]))
+					continue;
+				len = strlen(app_cache[i].name);
+				fits = (x + (len + 3) * cell_width) <= width;
+				if (!fits && shown > 0)
+					break;
 
-					/* Highlight selected suggestion */
-					if (shown == launcher_selection) {
-						bg = RGB_TO_ARGB(cfg_bar_text_color);
-						fg = RGB_TO_ARGB(cfg_bar_color);
-						/* Draw background */
-						for (py = 0; py < cell_height; py++) {
-							for (px = x; px < x + (len + 2) * cell_width && px < width; px++) {
-								pixels[py * width + px] = bg;
-							}
+				/* Highlight selected suggestion */
+				if (shown == launcher_selection) {
+					bg = RGB_TO_ARGB(cfg_bar_text_color);
+					fg = RGB_TO_ARGB(cfg_bar_color);
+					/* Draw background */
+					for (py = 0; py < cell_height; py++) {
+						for (px = x; px < x + (len + 2) * cell_width && px < width; px++) {
+							pixels[py * width + px] = bg;
 						}
-					} else {
-						fg = RGB_TO_ARGB(cfg_bar_text_color);
 					}
-
-					render_char_to_buffer(pixels, width, cell_height, x, 0, '[', fg);
-					x += cell_width;
-					for (j = 0; app_cache[i][j] && x < width - cell_width * 2; j++) {
-						render_char_to_buffer(pixels, width, cell_height, x, 0, app_cache[i][j], fg);
-						x += cell_width;
-					}
-					render_char_to_buffer(pixels, width, cell_height, x, 0, ']', fg);
-					x += cell_width * 2;
-					shown++;
+				} else {
+					fg = RGB_TO_ARGB(cfg_bar_text_color);
 				}
+
+				render_char_to_buffer(pixels, width, cell_height, x, 0, '[', fg);
+				x += cell_width;
+				for (j = 0; app_cache[i].name[j] && x < width - cell_width * 2; j++) {
+					render_char_to_buffer(pixels, width, cell_height, x, 0, app_cache[i].name[j], fg);
+					x += cell_width;
+				}
+				render_char_to_buffer(pixels, width, cell_height, x, 0, ']', fg);
+				x += cell_width * 2;
+				shown++;
 			}
 		}
 	} else {
@@ -7884,65 +9077,97 @@ render_tabs:
 		if (scroll_only_bar_update)
 			goto bar_done;
 
-		/* Right-align status: custom text OR date/time */
+		/* Right-align status: network button + custom text OR date/time */
 		now = time(NULL);
 		tm_info = localtime(&now);
 		
-		/* Check if custom status text is set */
-		if (cfg_status_text[0] != '\0') {
-			/* Custom status text mode */
-			int status_len = strlen(cfg_status_text);
-			right_x = width - (status_len + 3) * cell_width;
-			
-			if (right_x > x) {
-				x = right_x;
-				render_char_to_buffer(pixels, width, cell_height, x, 0, '|', RGB_TO_ARGB(cfg_bar_text_color));
-				x += cell_width * 2;
-				for (i = 0; cfg_status_text[i]; i++) {
-					render_char_to_buffer(pixels, width, cell_height, x, 0, (unsigned char)cfg_status_text[i], RGB_TO_ARGB(cfg_bar_text_color));
-					x += cell_width;
+		/* Reserve space for the network menu button [N] on the right */
+		{
+			int nbtn_len = strlen(cfg_net_menu_button);
+			int nbtn_cells = nbtn_len + 2; /* [nbtn] */
+			uint32_t nfg = RGB_TO_ARGB(cfg_bar_text_color);
+
+			/* Compute right-aligned start including the net button.
+			 * The renderer consumes: [N] (nbtn_cells) + 3 cells for the
+			 * separator before the text, plus 3 cells between date and time. */
+			if (cfg_status_text[0] != '\0') {
+				right_x = width - (nbtn_cells + 3 + (int)strlen(cfg_status_text)) * cell_width;
+			} else if (cfg_show_date || cfg_show_time) {
+				int total_chars = 0;
+				if (cfg_show_date)
+					strftime(datebuf, sizeof(datebuf), "%Y-%m-%d", tm_info);
+				if (cfg_show_time)
+					strftime(timebuf, sizeof(timebuf), "%I:%M:%S %p", tm_info);
+				date_len = cfg_show_date ? (int)strlen(datebuf) : 0;
+				time_len = cfg_show_time ? (int)strlen(timebuf) : 0;
+				if (cfg_show_date && cfg_show_time) {
+					total_chars = nbtn_cells + 3 + date_len + 3 + time_len;
+				} else if (cfg_show_date) {
+					total_chars = nbtn_cells + 3 + date_len;
+				} else if (cfg_show_time) {
+					total_chars = nbtn_cells + 3 + time_len;
+				} else {
+					total_chars = nbtn_cells;
 				}
+				right_x = width - total_chars * cell_width;
+			} else {
+				right_x = width - nbtn_cells * cell_width;
 			}
-		} else if (cfg_show_date || cfg_show_time) {
-			/* Date/time mode */
-			strftime(datebuf, sizeof(datebuf), "%Y-%m-%d", tm_info);
-			strftime(timebuf, sizeof(timebuf), "%I:%M:%S %p", tm_info);
-
-			date_len = cfg_show_date ? strlen(datebuf) : 0;
-			time_len = cfg_show_time ? strlen(timebuf) : 0;
-			
-			/* Calculate right-aligned position */
-			int total_chars = 0;
-			if (cfg_show_date && cfg_show_time) {
-				total_chars = date_len + time_len + 5; /* | date | time */
-			} else if (cfg_show_date) {
-				total_chars = date_len + 3; /* | date */
-			} else if (cfg_show_time) {
-				total_chars = time_len + 3; /* | time */
-			}
-			right_x = width - total_chars * cell_width;
 
 			if (right_x > x) {
 				x = right_x;
+
+				/* Network menu button */
+				if (netmenu_active) {
+					int px, py;
+					nfg = RGB_TO_ARGB(cfg_bar_color);
+					for (py = 0; py < cell_height; py++) {
+						for (px = x; px < x + nbtn_cells * cell_width && px < width; px++) {
+							pixels[py * width + px] = RGB_TO_ARGB(cfg_bar_text_color);
+						}
+					}
+				}
+				render_char_to_buffer(pixels, width, cell_height, x, 0, '[', nfg);
+				x += cell_width;
+				{
+					int bi;
+					for (bi = 0; cfg_net_menu_button[bi] && bi < 14; bi++) {
+						render_char_to_buffer(pixels, width, cell_height, x, 0, cfg_net_menu_button[bi], nfg);
+						x += cell_width;
+					}
+				}
+				render_char_to_buffer(pixels, width, cell_height, x, 0, ']', nfg);
+				x += cell_width;
+
+				/* Separator */
+				x += cell_width;
 				render_char_to_buffer(pixels, width, cell_height, x, 0, '|', RGB_TO_ARGB(cfg_bar_text_color));
 				x += cell_width * 2;
 				
-				if (cfg_show_date) {
-					for (i = 0; datebuf[i]; i++) {
-						render_char_to_buffer(pixels, width, cell_height, x, 0, datebuf[i], RGB_TO_ARGB(cfg_bar_text_color));
+				if (cfg_status_text[0] != '\0') {
+					/* Custom status text mode */
+					for (i = 0; cfg_status_text[i]; i++) {
+						render_char_to_buffer(pixels, width, cell_height, x, 0, (unsigned char)cfg_status_text[i], RGB_TO_ARGB(cfg_bar_text_color));
 						x += cell_width;
+					}
+				} else {
+					/* Date/time mode */
+					if (cfg_show_date) {
+						for (i = 0; datebuf[i]; i++) {
+							render_char_to_buffer(pixels, width, cell_height, x, 0, datebuf[i], RGB_TO_ARGB(cfg_bar_text_color));
+							x += cell_width;
+						}
+						if (cfg_show_time) {
+							x += cell_width;
+							render_char_to_buffer(pixels, width, cell_height, x, 0, '|', RGB_TO_ARGB(cfg_bar_text_color));
+							x += cell_width * 2;
+						}
 					}
 					if (cfg_show_time) {
-						x += cell_width;
-						render_char_to_buffer(pixels, width, cell_height, x, 0, '|', RGB_TO_ARGB(cfg_bar_text_color));
-						x += cell_width * 2;
-					}
-				}
-				
-				if (cfg_show_time) {
-					for (i = 0; timebuf[i]; i++) {
-						render_char_to_buffer(pixels, width, cell_height, x, 0, timebuf[i], RGB_TO_ARGB(cfg_bar_text_color));
-						x += cell_width;
+						for (i = 0; timebuf[i]; i++) {
+							render_char_to_buffer(pixels, width, cell_height, x, 0, timebuf[i], RGB_TO_ARGB(cfg_bar_text_color));
+							x += cell_width;
+						}
 					}
 				}
 			}

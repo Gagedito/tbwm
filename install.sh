@@ -124,6 +124,20 @@ install_deps() {
     success "Dependencies installed"
 }
 
+# Ask for the keyboard layout to bake into the compositor
+setup_keyboard_layout() {
+    echo ""
+    echo "Choose a keyboard layout to compile in."
+    echo "  e.g. latam, us, es, de, fr, gb  (empty = system default)"
+    read -r -p "Keyboard layout: " kblayout
+    if [ -n "$kblayout" ]; then
+        export TBWM_XKB_LAYOUT="$kblayout"
+        info "Will build with keyboard layout: $kblayout"
+    else
+        info "Using system default keyboard layout"
+    fi
+}
+
 # Check wlroots version
 check_wlroots() {
     info "Checking wlroots version..."
@@ -319,6 +333,7 @@ main() {
     
     check_not_root
     detect_distro
+    setup_keyboard_layout
     
     # Ask what to do
     echo ""

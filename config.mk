@@ -34,3 +34,10 @@ XLIBS = xcb xcb-icccm
 # To avoid warnings about them, we do not use -std=c99 and instead of using the
 # gmake default 'CC=c99', we use cc.
 CC = cc
+
+# Optional keyboard layout override, selectable at install time:
+#   TBWM_XKB_LAYOUT=latam make
+# (Uses CFLAGS because the Makefile redefines TBWMCPPFLAGS after including us.)
+ifdef TBWM_XKB_LAYOUT
+CFLAGS += -DTBWM_XKB_LAYOUT=\"$(TBWM_XKB_LAYOUT)\"
+endif

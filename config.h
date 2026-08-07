@@ -24,8 +24,15 @@ static const MonitorRule monrules[] = {
 	{ NULL,       0.55f, 1,      1,    &layouts[0], WL_OUTPUT_TRANSFORM_NORMAL,   -1,  -1 },
 };
 
-/* Default keyboard XKB rules - empty means system default */
+/* Default keyboard XKB rules - empty means system default.
+ * Override the keyboard layout at build/install time by setting
+ * TBWM_XKB_LAYOUT, e.g. `TBWM_XKB_LAYOUT=latam make` (the install
+ * script prompts for this). */
+#ifndef TBWM_XKB_LAYOUT
+#define TBWM_XKB_LAYOUT NULL
+#endif
 static const struct xkb_rule_names xkb_rules = {
+	.layout = TBWM_XKB_LAYOUT,
 	.options = NULL,
 };
 
