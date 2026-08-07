@@ -37,6 +37,8 @@ dependencies:
 - libxcb, xcb-icccm (for XWayland)
 
 ```bash
+git clone https://github.com/WheeledCord/tbwm
+cd tbwm
 make
 sudo make install
 ```
