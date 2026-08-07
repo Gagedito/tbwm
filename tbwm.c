@@ -17,6 +17,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/eventfd.h>
+#include <poll.h>
 #include <errno.h>
 #include <stdarg.h>
 #include <wayland-server-core.h>
@@ -918,6 +919,7 @@ static const struct wlr_buffer_impl titlebuf_impl = {
 };
 
 static pid_t child_pid = -1;
+static pid_t session_dbus_pid = -1;
 static int locked;
 static void *exclusive_focus;
 static struct wl_display *dpy;
@@ -1797,6 +1799,68 @@ checkidleinhibitor(struct wlr_surface *exclude)
 	wlr_idle_notifier_v1_set_inhibited(idle_notifier, inhibited);
 }
 
+/* If tbwm is started directly from a TTY (no display manager, no login
+ * session), there is no session D-Bus bus. Flatpak apps and the XDG desktop
+ * portals (screen capture, settings, etc.) need one, so start it here and
+ * export DBUS_SESSION_BUS_ADDRESS to every child tbwm spawns. */
+static void
+start_session_dbus(void)
+{
+	char buf[512];
+	char *p, *end;
+	struct pollfd pfd;
+	pid_t pid;
+	size_t n = 0;
+	int piperw[2];
+
+	if (getenv("DBUS_SESSION_BUS_ADDRESS"))
+		return;
+
+	if (pipe(piperw) < 0)
+		return;
+
+	if ((pid = fork()) == 0) {
+		dup2(piperw[1], STDOUT_FILENO);
+		close(piperw[0]);
+		close(piperw[1]);
+		execl("/bin/sh", "/bin/sh", "-c", "dbus-launch --sh-syntax 2>/dev/null",
+		      (char *)NULL);
+		_exit(127);
+	}
+	if (pid < 0) {
+		close(piperw[0]);
+		close(piperw[1]);
+		return;
+	}
+
+	close(piperw[1]);
+	pfd.fd = piperw[0];
+	pfd.events = POLLIN;
+	while (n < sizeof(buf) - 1 && poll(&pfd, 1, 5000) > 0) {
+		ssize_t r = read(piperw[0], buf + n, sizeof(buf) - 1 - n);
+		if (r <= 0)
+			break;
+		n += (size_t)r;
+	}
+	close(piperw[0]);
+	waitpid(pid, NULL, 0);
+
+	if (n == 0)
+		return;
+	buf[n] = '\0';
+
+	if ((p = strstr(buf, "DBUS_SESSION_BUS_ADDRESS='"))) {
+		p += strlen("DBUS_SESSION_BUS_ADDRESS='");
+		if ((end = strchr(p, '\'')))
+			*end = '\0';
+		setenv("DBUS_SESSION_BUS_ADDRESS", p, 1);
+		tbwm_log(TBWM_LOG_INFO, "tbwm: started session D-Bus bus: %s\n", p);
+	}
+	if ((p = strstr(buf, "DBUS_SESSION_BUS_PID="))) {
+		session_dbus_pid = atoi(p + strlen("DBUS_SESSION_BUS_PID="));
+	}
+}
+
 void
 cleanup(void)
 {
@@ -1811,6 +1875,10 @@ cleanup(void)
 	if (child_pid > 0) {
 		kill(-child_pid, SIGTERM);
 		waitpid(child_pid, NULL, 0);
+	}
+	if (session_dbus_pid > 0) {
+		kill(session_dbus_pid, SIGTERM);
+		session_dbus_pid = -1;
 	}
 	wlr_xcursor_manager_destroy(cursor_mgr);
 
@@ -10819,6 +10887,9 @@ main(int argc, char *argv[])
 	}
 	if (optind < argc)
 		goto usage;
+
+	/* Flatpak apps and XDG desktop portals need a session D-Bus bus */
+	start_session_dbus();
 
 	/* Wayland requires XDG_RUNTIME_DIR for creating its communications socket */
 	if (!getenv("XDG_RUNTIME_DIR"))
