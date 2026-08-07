@@ -4841,6 +4841,12 @@ motionnotify(uint32_t time, struct wlr_input_device *device, double dx, double d
 		/* If compositor entered screenshot-grab mode, forward motion only to the
 		 * seat (so the screenshot client can receive it) and avoid compositor UI. */
 		if (screenshot_mode) {
+			/* Recompute the surface under the cursor and give it pointer focus
+			 * so the screenshot client (e.g. slurp) receives enter/motion/button
+			 * events. wlroots only delivers motion to the focused surface. */
+			xytonode(cursor->x, cursor->y, &surface, NULL, NULL, &sx, &sy);
+			if (surface != seat->pointer_state.focused_surface)
+				wlr_seat_pointer_notify_enter(seat, surface, sx, sy);
 			wlr_seat_pointer_notify_motion(seat, time, sx, sy);
 			if (cursor && cursor_mgr)
 				wlr_cursor_set_xcursor(cursor, cursor_mgr, "crosshair");
