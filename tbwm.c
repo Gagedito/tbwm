@@ -4873,6 +4873,29 @@ motionnotify(uint32_t time, struct wlr_input_device *device, double dx, double d
 				}
 			}
 		}
+
+		/* Update net menu hover selection */
+		if (netmenu_active && selmon && !net_password_mode) {
+			int menu_x = selmon->m.x + selmon->m.width - 25 * cell_width;
+			int menu_y = selmon->m.y + cell_height;
+			int menu_w = 25 * cell_width;
+			int menu_h = 25 * cell_height;
+
+			if (cursor->x >= menu_x && cursor->x < menu_x + menu_w &&
+			    cursor->y >= menu_y && cursor->y < menu_y + menu_h) {
+				int rel_y = (int)(cursor->y - menu_y);
+				int hovered_row = rel_y / cell_height;
+
+				/* Row 0 is title bar, rows 1-23 are content */
+				if (hovered_row >= 1 && hovered_row <= 23) {
+					int new_selected = hovered_row - 1; /* 0-indexed content row */
+					if (new_selected != net_selected_row && new_selected < netmenu_item_count()) {
+						net_selected_row = new_selected;
+						updatenetmenu();
+					}
+				}
+			}
+		}
 	}
 
 	/* Update drag icon's position */
