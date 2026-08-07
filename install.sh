@@ -51,14 +51,17 @@ install_deps() {
             # on Arch the regular wlroots package is already 0.19+.
             if [ "$DISTRO" = "artix" ]; then
                 WLROOTS_PKG="wlroots0.19"
+                # runit service packages for the WiFi/Bluetooth menu
+                NET_DEPS="networkmanager networkmanager-runit bluez bluez-utils bluez-runit dbus-runit"
             else
                 WLROOTS_PKG="wlroots"
+                NET_DEPS="networkmanager bluez bluez-utils"
             fi
             sudo pacman -Sy --needed --noconfirm \
                 "$WLROOTS_PKG" wayland wayland-protocols libinput libxkbcommon \
                 pixman freetype2 pango cairo libxcb xcb-util-wm \
                 xorg-xwayland meson ninja gcc pkgconf make git \
-                fontconfig ttf-font grim slurp wl-clipboard || true
+                fontconfig ttf-font grim slurp wl-clipboard $NET_DEPS || true
             ;;
         debian|ubuntu|pop|linuxmint|elementary)
             # Debian-based - note: libwlroots-dev often not available or too old
@@ -71,7 +74,7 @@ install_deps() {
                 libdrm-dev libgbm-dev libseat-dev \
                 libdisplay-info-dev libliftoff-dev hwdata \
                 meson ninja-build gcc pkg-config make git \
-                fontconfig grim slurp wl-clipboard || true
+                fontconfig grim slurp wl-clipboard networkmanager bluez || true
             ;;
         fedora|rhel|centos|rocky|almalinux)
             # Fedora/RHEL-based
@@ -81,7 +84,7 @@ install_deps() {
                 freetype-devel pango-devel cairo-devel \
                 libxcb-devel xcb-util-wm-devel xorg-x11-server-Xwayland \
                 meson ninja-build gcc pkg-config make git \
-                fontconfig grim slurp wl-clipboard || true
+                fontconfig grim slurp wl-clipboard NetworkManager bluez || true
             ;;
         opensuse*|suse*)
             # openSUSE
@@ -90,7 +93,7 @@ install_deps() {
                 libinput-devel libxkbcommon-devel libpixman-1-0-devel \
                 freetype2-devel pango-devel cairo-devel \
                 libxcb-devel xwayland meson ninja gcc pkg-config make git \
-                fontconfig grim slurp wl-clipboard || true
+                fontconfig grim slurp wl-clipboard NetworkManager bluez || true
             ;;
         void)
             # Void Linux
@@ -100,7 +103,7 @@ install_deps() {
                 freetype-devel pango-devel cairo-devel \
                 libxcb-devel xcb-util-wm-devel xorg-server-xwayland \
                 meson ninja gcc pkg-config make git fontconfig \
-                grim slurp wl-clipboard || true
+                grim slurp wl-clipboard NetworkManager bluez || true
             ;;
         gentoo)
             warn "Gentoo detected. Please ensure you have the following USE flags enabled:"
@@ -120,6 +123,7 @@ install_deps() {
             echo "  - freetype2, pango, cairo, pixman"
             echo "  - libxcb, xcb-util-wm"
             echo "  - grim, slurp, wl-clipboard (for screenshots)"
+            echo "  - networkmanager (nmcli) and bluez/bluez-utils (bluetoothctl) for the network menu"
             echo "  - xwayland (optional, for X11 apps)"
             echo ""
             read -p "Continue anyway? [y/N] " -n 1 -r
@@ -372,6 +376,15 @@ install_tbwm() {
     sudo fc-cache -f /usr/share/fonts/tbwm 2>/dev/null || true
     success "Installed fonts (from fonts/ directory)"
     
+    # tbwm-network helper for the WiFi/Bluetooth menu
+    if [ -f "$SCRIPT_DIR/tbwm-network" ]; then
+        sudo cp "$SCRIPT_DIR/tbwm-network" /usr/local/bin/tbwm-network
+        sudo chmod 755 /usr/local/bin/tbwm-network
+        success "Installed /usr/local/bin/tbwm-network"
+    else
+        warn "tbwm-network not found; the network menu (WiFi/Bluetooth) will be empty"
+    fi
+    
     # Session file for display managers
     sudo mkdir -p /usr/share/wayland-sessions
     sudo tee /usr/share/wayland-sessions/tbwm.desktop > /dev/null << 'EOF'
@@ -406,6 +419,37 @@ export LD_LIBRARY_PATH="/usr/local/lib:/usr/local/lib64:$LD_LIBRARY_PATH"
 exec /usr/local/bin/tbwm.bin "$@"
 EOF
         sudo chmod 755 /usr/local/bin/tbwm
+    fi
+
+    enable_net_services
+}
+
+# Enable NetworkManager and Bluetooth services for the WiFi/Bluetooth menu
+enable_net_services() {
+    info "Enabling NetworkManager and Bluetooth services..."
+    if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+        sudo systemctl enable --now NetworkManager bluetooth 2>/dev/null || \
+            warn "Could not enable NetworkManager/bluetooth (systemd)"
+    elif [ -d /etc/runit/runsvdir/current ]; then
+        # runit (Artix, Void): link service dirs into runsvdir
+        for svc in NetworkManager bluetoothd; do
+            if [ -d "/etc/runit/sv/$svc" ]; then
+                sudo ln -sf "/etc/runit/sv/$svc" "/etc/runit/runsvdir/current/"
+                info "runit service '$svc' enabled"
+            else
+                warn "runit service dir /etc/runit/sv/$svc not found (is the -runit package installed?)"
+            fi
+        done
+    elif command -v rc-update >/dev/null 2>&1; then
+        # openrc (Gentoo, Artix-openrc)
+        sudo rc-update add NetworkManager default 2>/dev/null || \
+            warn "could not add NetworkManager to openrc default"
+        sudo rc-update add bluetoothd default 2>/dev/null || \
+            warn "could not add bluetoothd to openrc default"
+        sudo rc-service NetworkManager start 2>/dev/null || true
+        sudo rc-service bluetoothd start 2>/dev/null || true
+    else
+        warn "Unknown init system: enable NetworkManager and Bluetooth manually"
     fi
 }
 
