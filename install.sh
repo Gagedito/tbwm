@@ -130,12 +130,87 @@ install_deps() {
     success "Dependencies installed"
 }
 
-# Ask for the keyboard layout to bake into the compositor
+# Detect the keyboard layout currently used on the system / DE.
+# Order matters: file-based sources reflect the real layout, while
+# setxkbmap -query reports the X layout and is only reliable in a pure
+# X11 session (under Wayland it would query XWayland, which is wrong).
+detect_keyboard_layout() {
+    local detected=""
+
+    # 1. KDE Plasma
+    if [ -z "$detected" ] && [ -f "$HOME/.config/kxkbrc" ]; then
+        detected="$(sed -n 's/^LayoutList=//p' "$HOME/.config/kxkbrc" | head -1)"
+    fi
+
+    # 2. /etc/default/keyboard (Debian/Ubuntu, also present on some Arch/Artix systems)
+    if [ -z "$detected" ] && [ -f /etc/default/keyboard ]; then
+        detected="$(sed -n 's/^XKBLAYOUT="\?\([^"]*\)"\?.*/\1/p' /etc/default/keyboard)"
+    fi
+
+    # 3. Xorg keyboard config
+    if [ -z "$detected" ] && [ -d /etc/X11/xorg.conf.d ]; then
+        detected="$(grep -rhoE 'XkbLayout[[:space:]]+"[^"]+"' /etc/X11/xorg.conf.d 2>/dev/null | head -1 | sed -E 's/.*"([^"]+)"/\1/')"
+    fi
+
+    # 4. systemd-based distros
+    if [ -z "$detected" ] && command -v localectl >/dev/null 2>&1; then
+        detected="$(localectl status 2>/dev/null | awk '/X11 Layout/{print $3}')"
+    fi
+
+    # 5. GNOME
+    if [ -z "$detected" ] && command -v gsettings >/dev/null 2>&1; then
+        detected="$(gsettings get org.gnome.desktop.input-sources sources 2>/dev/null | sed -n "s/.*'xkb', *'\([^']*\)'.*/\1/p")"
+    fi
+
+    # 6. Pure X11 session only (setxkbmap is unreliable under Wayland/XWayland)
+    if [ -z "$detected" ] && [ "$XDG_SESSION_TYPE" = "x11" ] && command -v setxkbmap >/dev/null 2>&1; then
+        detected="$(setxkbmap -query 2>/dev/null | awk -F': *' '/layout/{print $2; exit}')"
+    fi
+
+    # Sanitize: layouts never contain spaces
+    if [[ "$detected" =~ [^A-Za-z0-9_,()+.-] ]]; then
+        detected=""
+    fi
+
+    echo "$detected"
+}
+
+# Ask for the keyboard layout to bake into the compositor, defaulting to the
+# layout detected on the system / DE when possible.
 setup_keyboard_layout() {
+    local detected
+    detected="$(detect_keyboard_layout)"
+
     echo ""
-    echo "Choose a keyboard layout to compile in."
-    echo "  e.g. latam, us, es, de, fr, gb  (empty = system default)"
-    read -r -p "Keyboard layout: " kblayout
+    if [ -n "$detected" ]; then
+        echo "Detected keyboard layout: $detected"
+        echo "  (press Enter to use it, type another layout, or 'none' for system default)"
+        read -r -p "Keyboard layout [$detected]: " kblayout
+        case "$kblayout" in
+            "")
+                kblayout="$detected"
+                ;;
+            "system default"|"system"|"default"|"none")
+                kblayout=""
+                ;;
+        esac
+    else
+        echo "No keyboard layout detected on this system."
+        echo "  e.g. latam, us, es, de, fr, gb  (empty = system default)"
+        read -r -p "Keyboard layout: " kblayout
+        case "$kblayout" in
+            ""|"system default"|"system"|"default"|"none")
+                kblayout=""
+                ;;
+        esac
+    fi
+
+    # Safety net: layouts are single tokens without spaces; reject anything else.
+    if [[ "$kblayout" =~ [^A-Za-z0-9_,()+.-] ]]; then
+        warn "Invalid keyboard layout '$kblayout'. Using system default."
+        kblayout=""
+    fi
+
     if [ -n "$kblayout" ]; then
         export TBWM_XKB_LAYOUT="$kblayout"
         info "Will build with keyboard layout: $kblayout"
