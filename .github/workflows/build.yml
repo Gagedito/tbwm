@@ -37,7 +37,7 @@ jobs:
           git clone --depth 1 --branch pixman-0.44.0 \
             https://gitlab.freedesktop.org/pixman/pixman.git /tmp/pixman
           cd /tmp/pixman
-          meson setup build --prefix=/usr -Dtests=false -Dlibpng=disabled
+          meson setup build --prefix=/usr -Dtests=disabled -Dlibpng=disabled
           ninja -C build
           sudo ninja -C build install
 
