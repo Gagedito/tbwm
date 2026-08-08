@@ -51,8 +51,14 @@ install_deps() {
             # on Arch the regular wlroots package is already 0.19+.
             if [ "$DISTRO" = "artix" ]; then
                 WLROOTS_PKG="wlroots0.19"
-                # runit service packages for the WiFi/Bluetooth menu
-                NET_DEPS="networkmanager networkmanager-runit bluez bluez-utils bluez-runit dbus-runit"
+                # runit service packages for the WiFi/Bluetooth menu. If connman
+                # is already installed, keep using it instead of NetworkManager
+                # (installing both leaves the network menu without a backend).
+                if [ "$NET_BACKEND" = "connman" ]; then
+                    NET_DEPS="connman connman-runit bluez bluez-utils bluez-runit dbus-runit"
+                else
+                    NET_DEPS="networkmanager networkmanager-runit bluez bluez-utils bluez-runit dbus-runit"
+                fi
             else
                 WLROOTS_PKG="wlroots"
                 NET_DEPS="networkmanager bluez bluez-utils"
@@ -451,17 +457,54 @@ EOF
     fi
 }
 
-# Enable NetworkManager and Bluetooth services for the WiFi/Bluetooth menu
+# Pick which network manager is in use (connman and NetworkManager conflict if
+# both are enabled at the same time, so we always enable exactly one of them).
+detect_net_backend() {
+    NET_BACKEND="networkmanager"
+    if pgrep -x connmand >/dev/null 2>&1; then
+        NET_BACKEND="connman"
+    elif [ "$(nmcli -t -f RUNNING general status 2>/dev/null)" = "running" ]; then
+        NET_BACKEND="networkmanager"
+    elif command -v connmanctl >/dev/null 2>&1; then
+        NET_BACKEND="connman"
+    fi
+    info "Network backend: $NET_BACKEND"
+}
+
+# Enable the active network manager and Bluetooth services for the menu
 enable_net_services() {
-    info "Enabling NetworkManager and Bluetooth services..."
+    detect_net_backend
+    if [ "$NET_BACKEND" = "connman" ]; then
+        NET_SERVICE="connmand"
+        info "Enabling connman ($NET_SERVICE) and Bluetooth services..."
+    else
+        NET_SERVICE="NetworkManager"
+        info "Enabling NetworkManager and Bluetooth services..."
+    fi
+
     if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
-        sudo systemctl enable --now NetworkManager bluetooth 2>/dev/null || \
-            warn "Could not enable NetworkManager/bluetooth (systemd)"
+        # ensure only one network manager is enabled/started
+        if [ "$NET_SERVICE" = "connmand" ]; then
+            sudo systemctl disable --now NetworkManager 2>/dev/null || true
+        else
+            sudo systemctl disable --now connmand 2>/dev/null || true
+        fi
+        sudo systemctl enable --now "$NET_SERVICE" bluetooth 2>/dev/null || \
+            warn "Could not enable $NET_SERVICE/bluetooth (systemd)"
     elif [ -d /etc/runit/runsvdir/current ]; then
         # runit (Artix, Void): link service dirs into runsvdir
-        for svc in NetworkManager bluetoothd; do
+        OTHER="connmand"
+        [ "$NET_SERVICE" = "connmand" ] && OTHER="NetworkManager"
+        # remove the other manager so they never fight over the interface
+        if [ -d "/etc/runit/sv/$OTHER" ]; then
+            sudo rm -f "/etc/runit/runsvdir/current/$OTHER"
+            sudo sv down "$OTHER" 2>/dev/null || true
+            info "runit service '$OTHER' disabled"
+        fi
+        for svc in "$NET_SERVICE" bluetoothd; do
             if [ -d "/etc/runit/sv/$svc" ]; then
                 sudo ln -sf "/etc/runit/sv/$svc" "/etc/runit/runsvdir/current/"
+                sudo sv up "$svc" 2>/dev/null || true
                 info "runit service '$svc' enabled"
             else
                 warn "runit service dir /etc/runit/sv/$svc not found (is the -runit package installed?)"
@@ -469,14 +512,18 @@ enable_net_services() {
         done
     elif command -v rc-update >/dev/null 2>&1; then
         # openrc (Gentoo, Artix-openrc)
-        sudo rc-update add NetworkManager default 2>/dev/null || \
-            warn "could not add NetworkManager to openrc default"
+        OTHER="connmand"
+        [ "$NET_SERVICE" = "connmand" ] && OTHER="NetworkManager"
+        sudo rc-update del "$OTHER" default 2>/dev/null || true
+        sudo rc-service "$OTHER" stop 2>/dev/null || true
+        sudo rc-update add "$NET_SERVICE" default 2>/dev/null || \
+            warn "could not add $NET_SERVICE to openrc default"
         sudo rc-update add bluetoothd default 2>/dev/null || \
             warn "could not add bluetoothd to openrc default"
-        sudo rc-service NetworkManager start 2>/dev/null || true
+        sudo rc-service "$NET_SERVICE" start 2>/dev/null || true
         sudo rc-service bluetoothd start 2>/dev/null || true
     else
-        warn "Unknown init system: enable NetworkManager and Bluetooth manually"
+        warn "Unknown init system: enable $NET_SERVICE and Bluetooth manually"
     fi
 }
 
@@ -490,6 +537,7 @@ main() {
     
     check_not_root
     detect_distro
+    detect_net_backend
     setup_keyboard_layout
     
     # Ask what to do
