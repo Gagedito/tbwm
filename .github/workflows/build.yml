@@ -19,7 +19,6 @@ jobs:
             libwayland-dev libwayland-bin wayland-protocols \
             libxkbcommon-dev xkb-data libinput-dev libpixman-1-dev \
             libfreetype-dev libxcb1-dev libxcb-icccm4-dev \
-            libxcb-render-util0-dev xwayland \
             libdrm-dev libgbm-dev libegl1-mesa-dev libgles2-mesa-dev \
             libseat-dev libffi-dev libxml2-dev hwdata \
             libdisplay-info-dev libliftoff-dev
@@ -47,7 +46,7 @@ jobs:
           git clone --depth 1 --branch 0.19.0 \
             https://gitlab.freedesktop.org/wlroots/wlroots.git /tmp/wlroots
           cd /tmp/wlroots
-          meson setup build --prefix=/usr/local -Dexamples=false
+          meson setup build --prefix=/usr/local -Dexamples=false -Dxwayland=disabled
           ninja -C build
           sudo ninja -C build install
           sudo ldconfig
@@ -57,5 +56,5 @@ jobs:
       - name: Build tbwm
         run: |
           export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
-          TBWM_XKB_LAYOUT=latam make -j2
+          TBWM_XKB_LAYOUT=latam make -j2 XWAYLAND=
           test -x tbwm && echo "tbwm built OK"
