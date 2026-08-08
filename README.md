@@ -9,6 +9,8 @@ features:
 - scheme configuration: lots configurable at runtime via ~/.config/tbwm/config.scm (not that good tho)
 - launcher: you can press super+d for application launcher. i should probably make it a seperate app but like uhuhuj
 - scheme repl: (super+shift+;)
+- network menu (super+n): wifi + bluetooth with password prompt and in-menu pairing passkey dialog (see tbwm-network)
+- screen capture with grim+slurp built into the default config (Print / S-Print)
 
 ## installation
 

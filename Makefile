@@ -17,11 +17,13 @@ TBWMCFLAGS = `$(PKG_CONFIG) --cflags $(PKGS)` $(WLR_INCS) $(TBWMCPPFLAGS) $(TBWM
 LDLIBS    = `$(PKG_CONFIG) --libs $(PKGS)` $(WLR_LIBS) -lm $(LIBS)
 
 all: tbwm
-tbwm: tbwm.o util.o s7.o
-	$(CC) tbwm.o util.o s7.o $(TBWMCFLAGS) $(LDFLAGS) $(LDLIBS) -ldl -o $@
+tbwm: tbwm.o bluetooth.o util.o s7.o
+	$(CC) tbwm.o bluetooth.o util.o s7.o $(TBWMCFLAGS) $(LDFLAGS) $(LDLIBS) -ldl -o $@
 tbwm.o: tbwm.c client.h config.h config.mk s7.h cursor-shape-v1-protocol.h \
 	pointer-constraints-unstable-v1-protocol.h wlr-layer-shell-unstable-v1-protocol.h \
-	wlr-output-power-management-unstable-v1-protocol.h xdg-shell-protocol.h
+	wlr-output-power-management-unstable-v1-protocol.h xdg-shell-protocol.h bluetooth.h
+bluetooth.o: bluetooth.c bluetooth.h config.mk
+	$(CC) $(CPPFLAGS) $(TBWMCFLAGS) -o $@ -c bluetooth.c
 util.o: util.c util.h
 s7.o: s7.c s7.h
 	$(CC) -c -O2 -I. s7.c -o s7.o
