@@ -446,6 +446,7 @@ static int netmenu_item_count(void);
 static void netmenu_refresh(void);
 static void netmenu_parse(void);
 static void netmenu_build_groups(void);
+static void netmenu_build_subgroups(void);
 static void netmenu_cancel_load(void);
 static int netmenu_read_cb(int fd, uint32_t mask, void *data);
 static void togglenetmenu(const Arg *arg);
@@ -736,6 +737,7 @@ static struct TitleBuffer *appmenu_tb = NULL;  /* cached buffer for reuse */
 typedef struct {
 	char category[NET_CAT_LEN];
 	char group[NET_CAT_LEN];
+	char subgroup[NET_CAT_LEN];
 	char name[NET_NAME_LEN];
 	char exec[NET_EXEC_LEN];
 	int needspass;  /* 1 = requires a password that tbwm must ask for */
@@ -754,6 +756,10 @@ static int net_current_category = -1;  /* -1 = showing categories, >=0 = showing
 static char net_groups[MAX_NET_CATEGORIES][NET_CAT_LEN];
 static int net_group_count = 0;
 static int net_current_group = -1;  /* -1 = showing sub-topics, >=0 = showing entries of that sub-topic */
+static char net_subgroups[MAX_NET_CATEGORIES][NET_CAT_LEN];
+static int net_subgroup_count = 0;
+static int net_current_subgroup = -1;  /* -1 = showing sub-topics' entities, >=0 = showing that entity's actions */
+static int net_group_has_sub = 0;  /* 1 = the selected group has an entity level; 0 = show entries directly */
 
 /* In-menu password entry (for WiFi networks that need one) */
 static int net_password_mode = 0;
@@ -1510,6 +1516,8 @@ buttonpress(struct wl_listener *listener, void *data)
 						if (cat_idx < net_category_count) {
 							net_current_category = cat_idx;
 							net_current_group = -1;
+							net_current_subgroup = -1;
+							net_group_has_sub = 0;
 							net_scroll_offset = 0;
 							net_selected_row = 0;
 							netmenu_build_groups();
@@ -1523,6 +1531,8 @@ buttonpress(struct wl_listener *listener, void *data)
 							/* Clicked "Back" - to categories */
 							net_current_category = -1;
 							net_current_group = -1;
+							net_current_subgroup = -1;
+							net_group_has_sub = 0;
 							net_scroll_offset = 0;
 							net_selected_row = 0;
 							updatenetmenu();
@@ -1531,18 +1541,47 @@ buttonpress(struct wl_listener *listener, void *data)
 							int target = content_row - 1; /* -1 for Back row */
 							if (target < net_group_count) {
 								net_current_group = target;
+								net_current_subgroup = -1;
+								net_scroll_offset = 0;
+								net_selected_row = 0;
+								netmenu_build_subgroups();
+								net_group_has_sub = (net_subgroup_count > 0);
+								updatenetmenu();
+							}
+						}
+					} else if (net_group_has_sub && net_current_subgroup < 0) {
+						/* In entities (sub-topic's networks/devices) view */
+						if (content_row == 0) {
+							/* Clicked "Back" - to sub-topics */
+							net_current_group = -1;
+							net_current_subgroup = -1;
+							net_group_has_sub = 0;
+							net_scroll_offset = 0;
+							net_selected_row = 0;
+							updatenetmenu();
+						} else {
+							/* Clicked on an entity */
+							int target = content_row - 1; /* -1 for Back row */
+							if (target < net_subgroup_count) {
+								net_current_subgroup = target;
 								net_scroll_offset = 0;
 								net_selected_row = 0;
 								updatenetmenu();
 							}
 						}
 					} else {
-						/* In entries view */
+						/* In actions view (either a sub-topic without entities,
+						 * or an entity's actions) */
 						if (content_row == 0) {
 							/* Clicked "Back" */
-							if (net_group_count > 0) {
+							if (net_current_subgroup >= 0) {
+								/* Back to entities view */
+								net_current_subgroup = -1;
+							} else if (net_group_count > 0) {
+								/* Back to sub-topics */
 								net_current_group = -1;
 							} else {
+								/* Back to categories */
 								net_current_category = -1;
 								net_current_group = -1;
 							}
@@ -1550,16 +1589,18 @@ buttonpress(struct wl_listener *listener, void *data)
 							net_selected_row = 0;
 							updatenetmenu();
 						} else {
-							/* Clicked on an entry */
+							/* Clicked on an action */
 							const char *cat = net_categories[net_current_category];
 							const char *group = (net_group_count == 0) ? "" : net_groups[net_current_group];
+							const char *sub = (net_current_subgroup >= 0) ? net_subgroups[net_current_subgroup] : "";
 							int e_idx = 0;
 							int display_row = 1;
 							int i;
 							
 							for (i = 0; i < net_entry_count; i++) {
 								if (strcmp(net_entries[i].category, cat) == 0 &&
-								    strcmp(net_entries[i].group, group) == 0) {
+								    strcmp(net_entries[i].group, group) == 0 &&
+								    strcmp(net_entries[i].subgroup, sub) == 0) {
 									if (e_idx >= net_scroll_offset) {
 										if (display_row == content_row) {
 											/* Found the clicked entry - run it */
@@ -3889,23 +3930,43 @@ netmenu_item_count(void)
 	} else if (net_current_group < 0) {
 		/* Showing sub-topics of the category */
 		return net_group_count + 1; /* +1 for "< Back" */
-	} else {
-		/* Showing entries of a sub-topic */
+	} else if (net_group_has_sub && net_current_subgroup < 0) {
+		/* Showing entities (each network/device) of the selected sub-topic */
+		return net_subgroup_count + 1; /* +1 for "< Back" */
+	} else if (net_current_subgroup < 0) {
+		/* Showing actions of a sub-topic that has no entity level */
 		const char *cat = net_categories[net_current_category];
-		const char *group = (net_group_count == 0) ? "" : net_groups[net_current_group];
+		const char *group = net_groups[net_current_group];
 		int count = 1; /* "< Back" item */
 		int i;
 		for (i = 0; i < net_entry_count; i++) {
 			if (strcmp(net_entries[i].category, cat) == 0 &&
-			    strcmp(net_entries[i].group, group) == 0)
+			    strcmp(net_entries[i].group, group) == 0 &&
+			    net_entries[i].subgroup[0] == '\0')
+				count++;
+		}
+		return count;
+	} else {
+		/* Showing actions of a specific entity */
+		const char *cat = net_categories[net_current_category];
+		const char *group = net_groups[net_current_group];
+		const char *sub = net_subgroups[net_current_subgroup];
+		int count = 1; /* "< Back" item */
+		int i;
+		for (i = 0; i < net_entry_count; i++) {
+			if (strcmp(net_entries[i].category, cat) == 0 &&
+			    strcmp(net_entries[i].group, group) == 0 &&
+			    strcmp(net_entries[i].subgroup, sub) == 0)
 				count++;
 		}
 		return count;
 	}
 }
 
-	/* Parse the accumulated netmenu command output into net_entries and
-	 * net_categories. Each line is "Category<TAB>Group<TAB>Name<TAB>exec[<TAB>needspass]". */
+/* Parse the accumulated netmenu command output into net_entries and
+ * net_categories. New format: "Category<TAB>Group<TAB>Subgroup<TAB>Name<TAB>exec[<TAB>needspass]".
+ * Legacy format "Category<TAB>Group<TAB>Name<TAB>exec[<TAB>needspass]" is still
+ * detected (the 3rd field then is the action name, e.g. "Conectar a X"). */
 static void
 netmenu_parse(void)
 {
@@ -3917,63 +3978,61 @@ netmenu_parse(void)
 
 	netmenu_out[netmenu_out_len] = '\0';
 	while (n < MAX_NET_ENTRIES && *p) {
-		char *line;
-		char *tab1, *tab2, *tab3, *tab4;
-		char *cat, *group, *name, *exec;
-		int needspass = 0;
+		char line[512];
+		char *tok[6];
+		int nt = 0;
 		int ci;
 
-		line = p;
-		p = strchr(p, '\n');
-		if (p)
-			*p++ = '\0';
+		{
+			char *eol = strchr(p, '\n');
+			size_t len = eol ? (size_t)(eol - p) : strlen(p);
+			if (len >= sizeof(line))
+				len = sizeof(line) - 1;
+			memcpy(line, p, len);
+			line[len] = '\0';
+			p = eol ? eol + 1 : p + len;
+		}
 
 		if (!line[0])
 			continue;
 
-		tab1 = strchr(line, '\t');
-		if (tab1) {
-			*tab1 = '\0';
-			cat = line;
-			tab2 = strchr(tab1 + 1, '\t');
-			if (tab2) {
-				*tab2 = '\0';
-				group = tab1 + 1;
-				tab3 = strchr(tab2 + 1, '\t');
-				if (tab3) {
-					*tab3 = '\0';
-					name = tab2 + 1;
-					exec = tab3 + 1;
-					tab4 = strchr(tab3 + 1, '\t');
-					if (tab4) {
-						*tab4 = '\0';
-						needspass = (tab4[1] == '1');
-					}
-				} else {
-					name = tab2 + 1;
-					exec = tab2 + 1;
-				}
-			} else {
-				group = "";
-				name = tab1 + 1;
-				exec = tab1 + 1;
+		{
+			char *t = line;
+			while (nt < 6) {
+				tok[nt] = t;
+				nt++;
+				t = strchr(t, '\t');
+				if (!t)
+					break;
+				*t++ = '\0';
 			}
-		} else {
-			cat = "Network";
-			group = "";
-			name = line;
-			exec = line;
 		}
 
-		strncpy(net_entries[n].category, cat, NET_CAT_LEN - 1);
+		/* Detect legacy vs new layout */
+		if (nt >= 5 &&
+		    (strcmp(tok[3], "Conectar") == 0 || strcmp(tok[3], "Desconectar") == 0 ||
+		     strcmp(tok[3], "Olvidar") == 0 || strcmp(tok[3], "Info") == 0)) {
+			/* new: cat group subgroup name exec[ need] */
+			strncpy(net_entries[n].category, tok[0], NET_CAT_LEN - 1);
+			strncpy(net_entries[n].group, tok[1], NET_CAT_LEN - 1);
+			strncpy(net_entries[n].subgroup, tok[2], NET_CAT_LEN - 1);
+			strncpy(net_entries[n].name, tok[3], NET_NAME_LEN - 1);
+			strncpy(net_entries[n].exec, tok[4], NET_EXEC_LEN - 1);
+			net_entries[n].needspass = (nt >= 6 && tok[5][0] == '1');
+		} else {
+			/* legacy: cat group name exec[ need] */
+			strncpy(net_entries[n].category, tok[0], NET_CAT_LEN - 1);
+			strncpy(net_entries[n].group, tok[1], NET_CAT_LEN - 1);
+			net_entries[n].subgroup[0] = '\0';
+			strncpy(net_entries[n].name, tok[2], NET_NAME_LEN - 1);
+			strncpy(net_entries[n].exec, tok[3], NET_EXEC_LEN - 1);
+			net_entries[n].needspass = (nt >= 5 && tok[4][0] == '1');
+		}
 		net_entries[n].category[NET_CAT_LEN - 1] = '\0';
-		strncpy(net_entries[n].group, group, NET_CAT_LEN - 1);
 		net_entries[n].group[NET_CAT_LEN - 1] = '\0';
-		strncpy(net_entries[n].name, name, NET_NAME_LEN - 1);
+		net_entries[n].subgroup[NET_CAT_LEN - 1] = '\0';
 		net_entries[n].name[NET_NAME_LEN - 1] = '\0';
-		strncpy(net_entries[n].exec, exec, NET_EXEC_LEN - 1);
 		net_entries[n].exec[NET_EXEC_LEN - 1] = '\0';
-		net_entries[n].needspass = needspass;
 
 		/* Add category if new */
 		for (ci = 0; ci < net_category_count; ci++) {
@@ -4014,6 +4073,38 @@ netmenu_build_groups(void)
 			strncpy(net_groups[net_group_count], net_entries[i].group, NET_CAT_LEN - 1);
 			net_groups[net_group_count][NET_CAT_LEN - 1] = '\0';
 			net_group_count++;
+		}
+	}
+}
+
+/* Build the list of entity sub-levels (e.g. each saved network or each BT
+ * device) for the currently selected group. If the group has no sub-level
+ * entries, net_group_has_sub is left 0 and the group's actions are shown
+ * directly. */
+static void
+netmenu_build_subgroups(void)
+{
+	int gi;
+	int i;
+
+	net_subgroup_count = 0;
+	for (i = 0; i < net_entry_count; i++) {
+		if (net_current_category < 0 ||
+		    strcmp(net_entries[i].category, net_categories[net_current_category]) != 0)
+			continue;
+		if (net_entries[i].group[0] == '\0' ||
+		    strcmp(net_entries[i].group, net_groups[net_current_group]) != 0)
+			continue;
+		if (net_entries[i].subgroup[0] == '\0')
+			continue;
+		for (gi = 0; gi < net_subgroup_count; gi++) {
+			if (strcmp(net_subgroups[gi], net_entries[i].subgroup) == 0)
+				break;
+		}
+		if (gi >= net_subgroup_count && net_subgroup_count < MAX_NET_CATEGORIES) {
+			strncpy(net_subgroups[net_subgroup_count], net_entries[i].subgroup, NET_CAT_LEN - 1);
+			net_subgroups[net_subgroup_count][NET_CAT_LEN - 1] = '\0';
+			net_subgroup_count++;
 		}
 	}
 }
@@ -4066,6 +4157,7 @@ netmenu_read_cb(int fd, uint32_t mask, void *data)
 	if (done) {
 		char saved_cat[NET_CAT_LEN] = "";
 		char saved_group[NET_CAT_LEN] = "";
+		char saved_subgroup[NET_CAT_LEN] = "";
 		int keep = 0;
 		int gi;
 		int i;
@@ -4093,6 +4185,8 @@ netmenu_read_cb(int fd, uint32_t mask, void *data)
 			saved_cat[NET_CAT_LEN - 1] = '\0';
 			if (net_current_group >= 0 && net_current_group < net_group_count)
 				strncpy(saved_group, net_groups[net_current_group], NET_CAT_LEN - 1);
+			if (net_current_subgroup >= 0 && net_current_subgroup < net_subgroup_count)
+				strncpy(saved_subgroup, net_subgroups[net_current_subgroup], NET_CAT_LEN - 1);
 			keep = 1;
 		}
 		netmenu_parse();
@@ -4112,6 +4206,17 @@ netmenu_read_cb(int fd, uint32_t mask, void *data)
 				if (strcmp(net_groups[gi], saved_group) == 0) {
 					net_current_group = gi;
 					break;
+				}
+			}
+			if (net_current_group >= 0) {
+				net_current_subgroup = -1;
+				netmenu_build_subgroups();
+				net_group_has_sub = (net_subgroup_count > 0);
+				for (gi = 0; gi < net_subgroup_count; gi++) {
+					if (strcmp(net_subgroups[gi], saved_subgroup) == 0) {
+						net_current_subgroup = gi;
+						break;
+					}
 				}
 			}
 		}
@@ -4188,7 +4293,10 @@ togglenetmenu(const Arg *arg)
 		net_password_reset();
 		net_current_category = -1;
 		net_current_group = -1;
+		net_current_subgroup = -1;
+		net_group_has_sub = 0;
 		net_group_count = 0;
+		net_subgroup_count = 0;
 		net_scroll_offset = 0;
 		net_selected_row = 0;
 		netmenu_refresh();
@@ -4298,16 +4406,30 @@ netmenukey(xkb_keysym_t sym)
 	item_count = netmenu_item_count();
 
 	if (sym == XKB_KEY_Escape) {
-		if (net_current_group >= 0) {
+		if (net_current_subgroup >= 0) {
+			if (net_group_has_sub) {
+				/* Back to entities view */
+				net_current_subgroup = -1;
+				net_scroll_offset = 0;
+				net_selected_row = 0;
+				updatenetmenu();
+			} else {
+				net_current_subgroup = -1;
+			}
+		} else if (net_current_group >= 0) {
 			/* Back to sub-topics (or direct entries fall to categories) */
 			if (net_group_count > 0) {
 				net_current_group = -1;
+				net_current_subgroup = -1;
+				net_group_has_sub = 0;
 				net_scroll_offset = 0;
 				net_selected_row = 0;
 				updatenetmenu();
 			} else {
 				net_current_category = -1;
 				net_current_group = -1;
+				net_current_subgroup = -1;
+				net_group_has_sub = 0;
 				net_scroll_offset = 0;
 				net_selected_row = 0;
 				updatenetmenu();
@@ -4316,6 +4438,8 @@ netmenukey(xkb_keysym_t sym)
 			/* Back to categories */
 			net_current_category = -1;
 			net_current_group = -1;
+			net_current_subgroup = -1;
+			net_group_has_sub = 0;
 			net_scroll_offset = 0;
 			net_selected_row = 0;
 			updatenetmenu();
@@ -4357,6 +4481,8 @@ netmenukey(xkb_keysym_t sym)
 			if (selected_idx < net_category_count) {
 				net_current_category = selected_idx;
 				net_current_group = -1;
+				net_current_subgroup = -1;
+				net_group_has_sub = 0;
 				net_scroll_offset = 0;
 				net_selected_row = 0;
 				netmenu_build_groups();
@@ -4370,6 +4496,8 @@ netmenukey(xkb_keysym_t sym)
 				/* Back to categories */
 				net_current_category = -1;
 				net_current_group = -1;
+				net_current_subgroup = -1;
+				net_group_has_sub = 0;
 				net_scroll_offset = 0;
 				net_selected_row = 0;
 				updatenetmenu();
@@ -4377,23 +4505,54 @@ netmenukey(xkb_keysym_t sym)
 				int target = selected_idx - 1; /* -1 for Back row */
 				if (target < net_group_count) {
 					net_current_group = target;
+					net_current_subgroup = -1;
+					net_scroll_offset = 0;
+					net_selected_row = 0;
+					netmenu_build_subgroups();
+					net_group_has_sub = (net_subgroup_count > 0);
+					updatenetmenu();
+				}
+			}
+		} else if (net_group_has_sub && net_current_subgroup < 0) {
+			/* Showing entities of a sub-topic (each network/device) */
+			if (selected_idx == 0) {
+				/* Back to sub-topics */
+				net_current_group = -1;
+				net_current_subgroup = -1;
+				net_group_has_sub = 0;
+				net_scroll_offset = 0;
+				net_selected_row = 0;
+				updatenetmenu();
+			} else {
+				int target = selected_idx - 1; /* -1 for Back row */
+				if (target < net_subgroup_count) {
+					net_current_subgroup = target;
 					net_scroll_offset = 0;
 					net_selected_row = 0;
 					updatenetmenu();
 				}
 			}
 		} else {
-			/* Showing entries */
+			/* Showing actions */
 			if (selected_idx == 0) {
-				/* Back to sub-topics */
-				if (net_group_count > 0) {
+				/* Back to sub-topics / entities / categories */
+				if (net_current_subgroup >= 0) {
+					net_current_subgroup = -1;
+					net_scroll_offset = 0;
+					net_selected_row = 0;
+					updatenetmenu();
+				} else if (net_group_count > 0) {
 					net_current_group = -1;
+					net_current_subgroup = -1;
+					net_group_has_sub = 0;
 					net_scroll_offset = 0;
 					net_selected_row = 0;
 					updatenetmenu();
 				} else {
 					net_current_category = -1;
 					net_current_group = -1;
+					net_current_subgroup = -1;
+					net_group_has_sub = 0;
 					net_scroll_offset = 0;
 					net_selected_row = 0;
 					updatenetmenu();
@@ -4401,13 +4560,15 @@ netmenukey(xkb_keysym_t sym)
 			} else {
 				const char *cat = net_categories[net_current_category];
 				const char *group = (net_group_count == 0) ? "" : net_groups[net_current_group];
+				const char *sub = (net_current_subgroup >= 0) ? net_subgroups[net_current_subgroup] : "";
 				int e_idx = 0;
 				int target = selected_idx - 1; /* -1 for Back row */
 				int i;
 
 				for (i = 0; i < net_entry_count; i++) {
 					if (strcmp(net_entries[i].category, cat) == 0 &&
-					    strcmp(net_entries[i].group, group) == 0) {
+					    strcmp(net_entries[i].group, group) == 0 &&
+					    strcmp(net_entries[i].subgroup, sub) == 0) {
 						if (e_idx == target) {
 							netmenu_run(&net_entries[i]);
 							return 1;
@@ -4421,15 +4582,32 @@ netmenukey(xkb_keysym_t sym)
 	}
 
 	if (sym == XKB_KEY_Left || sym == XKB_KEY_h || sym == XKB_KEY_BackSpace) {
-		if (net_current_group >= 0) {
+		if (net_current_subgroup >= 0) {
+			if (net_group_has_sub) {
+				/* Back to entities view */
+				net_current_subgroup = -1;
+				net_scroll_offset = 0;
+				net_selected_row = 0;
+				updatenetmenu();
+			} else {
+				net_current_subgroup = -1;
+				net_scroll_offset = 0;
+				net_selected_row = 0;
+				updatenetmenu();
+			}
+		} else if (net_current_group >= 0) {
 			if (net_group_count > 0) {
 				net_current_group = -1;
+				net_current_subgroup = -1;
+				net_group_has_sub = 0;
 				net_scroll_offset = 0;
 				net_selected_row = 0;
 				updatenetmenu();
 			} else {
 				net_current_category = -1;
 				net_current_group = -1;
+				net_current_subgroup = -1;
+				net_group_has_sub = 0;
 				net_scroll_offset = 0;
 				net_selected_row = 0;
 				updatenetmenu();
@@ -4438,6 +4616,8 @@ netmenukey(xkb_keysym_t sym)
 			/* Back to categories */
 			net_current_category = -1;
 			net_current_group = -1;
+			net_current_subgroup = -1;
+			net_group_has_sub = 0;
 			net_scroll_offset = 0;
 			net_selected_row = 0;
 			updatenetmenu();
@@ -8469,7 +8649,7 @@ updatenetmenu(void)
 				}
 			}
 		} else if (net_current_group < 0) {
-			/* Show sub-topics of the selected category */
+			/* Show sub-topics (groups) of the selected category */
 			int gi;
 			int displayed = 0;
 			int is_selected;
@@ -8526,10 +8706,70 @@ updatenetmenu(void)
 					displayed++;
 				}
 			}
+		} else if (net_group_has_sub && net_current_subgroup < 0) {
+			/* Show entities (each network/device) of the selected sub-topic */
+			int gi;
+			int displayed = 0;
+			int is_selected;
+			uint32_t row_fg;
+
+			/* First row: "< Back" */
+			is_selected = (net_selected_row == 0);
+			row_fg = is_selected ? highlight_fg : text_color;
+			{
+				int text_y = cell_height;
+				const char *back = "< Back";
+				int bi;
+
+				if (is_selected) {
+					int px, py;
+					for (py = text_y; py < text_y + cell_height; py++) {
+						for (px = cell_width; px < menu_width - cell_width; px++) {
+							pixels[py * menu_width + px] = highlight_bg;
+						}
+					}
+				}
+
+				for (bi = 0; back[bi] && bi < mtext; bi++) {
+					render_char_to_buffer(pixels, menu_width, menu_height,
+						cell_width + bi * cell_width, text_y,
+						back[bi], row_fg);
+				}
+			}
+
+			/* Show the entities */
+			for (gi = 0; gi < net_subgroup_count && displayed < crows - 1; gi++) {
+				if (gi >= net_scroll_offset) {
+					int text_y = (displayed + 2) * cell_height;
+					const char *sn = net_subgroups[gi];
+					int ni2;
+
+					is_selected = (displayed + 1 == net_selected_row);
+					row_fg = is_selected ? highlight_fg : text_color;
+
+					if (is_selected) {
+						int px, py;
+						for (py = text_y; py < text_y + cell_height; py++) {
+							for (px = cell_width; px < menu_width - cell_width; px++) {
+								pixels[py * menu_width + px] = highlight_bg;
+							}
+						}
+					}
+
+					for (ni2 = 0; sn[ni2] && ni2 < mtext; ni2++) {
+						render_char_to_buffer(pixels, menu_width, menu_height,
+							cell_width + ni2 * cell_width, text_y,
+							(unsigned char)sn[ni2], row_fg);
+					}
+					displayed++;
+				}
+			}
 		} else {
-			/* Show entries of the selected sub-topic */
+			/* Show actions of the selected sub-topic (direct) or of a specific
+			 * entity. The < Back> row returns to the appropriate upper level. */
 			const char *cat = net_categories[net_current_category];
 			const char *group = (net_group_count == 0) ? "" : net_groups[net_current_group];
+			const char *sub = (net_current_subgroup >= 0) ? net_subgroups[net_current_subgroup] : "";
 			int e_idx = 0;
 			int displayed = 0;
 			int is_selected;
@@ -8559,10 +8799,11 @@ updatenetmenu(void)
 				}
 			}
 
-			/* Show entries in this sub-topic */
+			/* Show actions in this sub-topic / entity */
 			for (i = 0; i < net_entry_count && displayed < crows - 1; i++) {
 				if (strcmp(net_entries[i].category, cat) == 0 &&
-				    strcmp(net_entries[i].group, group) == 0) {
+				    strcmp(net_entries[i].group, group) == 0 &&
+				    strcmp(net_entries[i].subgroup, sub) == 0) {
 					if (e_idx >= net_scroll_offset) {
 						int text_y = (displayed + 2) * cell_height;
 						const char *nm = net_entries[i].name;
