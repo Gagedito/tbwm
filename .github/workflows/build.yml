@@ -20,7 +20,17 @@ jobs:
             libxkbcommon-dev xkb-data libinput-dev libpixman-1-dev \
             libfreetype-dev libxcb1-dev libxcb-icccm4-dev \
             libdrm-dev libgbm-dev libegl1-mesa-dev libgles2-mesa-dev \
-            libseat-dev hwdata libdisplay-info-dev libliftoff-dev
+            libseat-dev libffi-dev libxml2-dev hwdata \
+            libdisplay-info-dev libliftoff-dev
+
+      - name: Build Wayland >= 1.23.1 from source (Ubuntu ships 1.22.0)
+        run: |
+          git clone --depth 1 --branch 1.23.1 \
+            https://gitlab.freedesktop.org/wayland/wayland.git /tmp/wayland
+          cd /tmp/wayland
+          meson setup build --prefix=/usr -Ddocumentation=false
+          ninja -C build
+          sudo ninja -C build install
 
       - name: Build wlroots 0.19 (not packaged on Ubuntu)
         run: |
