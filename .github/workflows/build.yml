@@ -34,7 +34,7 @@ jobs:
 
       - name: Build pixman >= 0.43 from source (Ubuntu ships 0.42.2)
         run: |
-          git clone --depth 1 --branch 0.44.0 \
+          git clone --depth 1 --branch pixman-0.44.0 \
             https://gitlab.freedesktop.org/pixman/pixman.git /tmp/pixman
           cd /tmp/pixman
           meson setup build --prefix=/usr -Dtests=false -Dlibpng=disabled
