@@ -11,6 +11,7 @@ features:
 - scheme repl: (super+shift+;)
 - network menu (super+n): wifi + bluetooth with password prompt and in-menu pairing passkey dialog (see tbwm-network)
 - screen capture with grim+slurp built into the default config (Print / S-Print)
+- wallpaper: layer-shell friendly. image with swaybg or dynamic wallpapers with waywallen via tbwm-wallpaper (degrades to default background if waywallen isn't installed)
 
 ## installation
 
