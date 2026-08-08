@@ -9426,6 +9426,7 @@ scm_toggle_thememenu(s7_scheme *sc, s7_pointer args)
 	return s7_t(sc);
 }
 
+/* Key helper: reload configuration (wrapper so we can bind it in C defaults) */
 void
 reload_config_key(const Arg *arg)
 {
