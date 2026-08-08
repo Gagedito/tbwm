@@ -133,6 +133,7 @@ modifiers: M=super S=shift C=ctrl A=alt
 (toggle-launcher)
 (toggle-repl)
 (toggle-appmenu)            ; toggle app menu
+(toggle-thememenu)          ; toggle in-WM color theme menu (colors/palette/custom)
 (set-menu-button "X")       ; set menu button label (default "X")
 (reload-config)
 (quit)

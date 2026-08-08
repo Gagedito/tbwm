@@ -54,6 +54,10 @@ default keys. change em in config.scm
 - super+shift+e - quit
 - ctrl+alt+f1-f12 - switch tty
 
+## theme (in-wm menus)
+
+- super+t - theme color menu (marco/barra/fondo: paleta o hex custom)
+
 ## mouse
 
 - super+left click - move window
