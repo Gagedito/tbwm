@@ -19,7 +19,7 @@ jobs:
             libwayland-dev libwayland-bin wayland-protocols \
             libxkbcommon-dev xkb-data libinput-dev libpixman-1-dev \
             libfreetype-dev libxcb1-dev libxcb-icccm4-dev \
-            libxcb-render-util0-dev libxcb-errors-dev xwayland \
+            libxcb-render-util0-dev xwayland \
             libdrm-dev libgbm-dev libegl1-mesa-dev libgles2-mesa-dev \
             libseat-dev libffi-dev libxml2-dev hwdata \
             libdisplay-info-dev libliftoff-dev
