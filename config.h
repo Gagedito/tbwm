@@ -29,7 +29,7 @@ static const MonitorRule monrules[] = {
  * TBWM_XKB_LAYOUT, e.g. `TBWM_XKB_LAYOUT=latam make` (the install
  * script prompts for this). */
 #ifndef TBWM_XKB_LAYOUT
-#define TBWM_XKB_LAYOUT "latam"
+#define TBWM_XKB_LAYOUT NULL
 #endif
 static const struct xkb_rule_names xkb_rules = {
 	.layout = TBWM_XKB_LAYOUT,

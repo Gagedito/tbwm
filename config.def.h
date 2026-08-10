@@ -60,7 +60,7 @@ static const struct xkb_rule_names xkb_rules = {
 	/* Keyboard layout: override at build time with TBWM_XKB_LAYOUT,
 	 * e.g. `TBWM_XKB_LAYOUT=latam make` (the install script prompts). */
 #ifndef TBWM_XKB_LAYOUT
-#define TBWM_XKB_LAYOUT "latam"
+#define TBWM_XKB_LAYOUT NULL
 #endif
 	.layout = TBWM_XKB_LAYOUT,
 	.options = NULL,
