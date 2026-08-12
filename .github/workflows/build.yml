@@ -21,7 +21,7 @@ jobs:
             libfreetype-dev libxcb1-dev libxcb-icccm4-dev \
             libdrm-dev libgbm-dev libegl1-mesa-dev libgles2-mesa-dev \
             libseat-dev libffi-dev libxml2-dev hwdata \
-            libdisplay-info-dev libliftoff-dev
+            libdisplay-info-dev libliftoff-dev libdbus-1-dev
 
       - name: Build Wayland >= 1.23.1 from source (Ubuntu ships 1.22.0)
         run: |
