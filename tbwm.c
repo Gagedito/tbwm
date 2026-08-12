@@ -419,9 +419,6 @@ static void resize(Client *c, struct wlr_box geo, int interact);
 static void run(char *startup_cmd);
 static void run_startup_commands(void);
 static void install_crash_handlers(void);
-static void hang_watchdog_kick(void);
-static void hang_handler(int sig);
-static void install_hang_watchdog(void);
 static void setcursor(struct wl_listener *listener, void *data);
 static void setcursorshape(struct wl_listener *listener, void *data);
 static void setfloating(Client *c, int floating);
@@ -475,11 +472,12 @@ static int thememenu_key(xkb_keysym_t sym);
 static void updatethememenu(void);
 static void theme_persist(void);
 static s7_pointer scm_toggle_thememenu(s7_scheme *sc, s7_pointer args);
-static void toggletraymenu(const Arg *arg);
-static int traymenu_key(xkb_keysym_t sym);
-static void updatetraymenu(void);
-static int traymenu_cells_h(void);
-static void tray_select_row(int row);
+ static void toggletraymenu(const Arg *arg);
+ static int traymenu_key(xkb_keysym_t sym);
+ static void updatetraymenu(void);
+ static int traymenu_cells_h(void);
+ static void tray_select_row(int row);
+ static void tray_menu_reset(void);
 static void tray_setup(void);
 static void tray_cleanup(void);
 static s7_pointer scm_toggle_tray_menu(s7_scheme *sc, s7_pointer args);
@@ -705,14 +703,11 @@ static int cfg_battery_poll = 0;         /* 1 = auto-update status text with bat
 static int battery_poll_interval = 60;   /* seconds between battery polls */
 static struct wl_event_source *battery_timer = NULL;
 
-/* ---- hang watchdog ---- */
-/* /tmp is tmpfs and is wiped on reboot, so crash/hang evidence is kept in the
+/* ---- crash diagnostics ---- */
+/* /tmp is tmpfs and is wiped on reboot, so crash evidence is kept in the
  * home directory instead. */
 #define TBWM_DIAG_DIR "/home/gage"
 #define TBWM_CRASH_LOG TBWM_DIAG_DIR "/tbwm-crash.log"
-#define TBWM_HANG_LOG  TBWM_DIAG_DIR "/tbwm-hang.log"
-#define TBWM_HANG_TIMEOUT_S 2
-static timer_t hang_watchdog = (timer_t)0;
 
 /* REPL state */
 static int repl_visible = 0;             /* 0 = REPL background/text hidden unless active */
@@ -1316,8 +1311,9 @@ applyrules(Client *c)
 	/* rule matching */
 	const char *appid, *title;
 	uint32_t newtags = 0;
-	int i;
+	int i, ri;
 	const Rule *r;
+	RuntimeRule *rr;
 	Monitor *mon = selmon, *m;
 
 	appid = client_get_appid(c);
@@ -1331,6 +1327,21 @@ applyrules(Client *c)
 			i = 0;
 			wl_list_for_each(m, &mons, link) {
 				if (r->monitor == i++)
+					mon = m;
+			}
+		}
+	}
+	/* Runtime rules added via Scheme (add-rule). id/title are '\0'-terminated
+	 * fixed buffers: an empty buffer means "match any". */
+	for (ri = 0; ri < cfg_rule_count; ri++) {
+		rr = &cfg_rules[ri];
+		if ((!rr->title[0] || strstr(title, rr->title))
+				&& (!rr->id[0] || strstr(appid, rr->id))) {
+			c->isfloating = rr->isfloating;
+			newtags |= rr->tags;
+			i = 0;
+			wl_list_for_each(m, &mons, link) {
+				if (rr->monitor == i++)
 					mon = m;
 			}
 		}
@@ -1883,7 +1894,7 @@ buttonpress(struct wl_listener *listener, void *data)
 				return; /* Consume the click */
 			} else {
 				/* Click outside menu - close it */
-				traymenu_active = 0;
+				tray_menu_reset();
 				updatetraymenu();
 				updatebars();
 			}
@@ -7684,9 +7695,6 @@ run(char *startup_cmd)
 	/* Dump a backtrace to TBWM_CRASH_LOG if we abort/segfault, then
 	 * re-raise so the behaviour matches a plain crash. */
 	install_crash_handlers();
-	/* If the main event loop ever stalls (hang instead of crash), SIGALRM
-	 * interrupts it, dumps the stack to TBWM_HANG_LOG and aborts. */
-	install_hang_watchdog();
 
 	/* System tray: own the StatusNotifierWatcher name and start pumping the
 	 * session D-Bus fd so minimized apps (Discord/Spotify/Steam...) can
@@ -10009,9 +10017,6 @@ timingtimer(void *data)
 	fprintf(stderr, "[TIMING TICK]\n");
 	fflush(stderr);
 	timing_report();
-	/* Advance the hang watchdog: if this timer stops running, the event loop
-	 * is stuck and SIGALRM fires (see hang_handler). */
-	hang_watchdog_kick();
 	wl_event_source_timer_update(timing_timer, 500);
 	return 0;
 }
@@ -11769,16 +11774,28 @@ tray_item_free_helper(TrayItem *it)
 }
 
 /* Recursively parse a dbusmenu GetLayout item array into sibling nodes.
- * `arr` must be an iterator over child structs (id, props dict, child array). */
+ * `arr` must be an iterator over child structs (id, props dict, child array).
+ * depth guards against a hostile/buggy service nesting menus forever and
+ * *budget caps the total number of nodes parsed to avoid a memory blow-up. */
 static TrayNode *
-tray_parse_items(DBusMessageIter *arr, TrayNode *parent)
+tray_parse_items(DBusMessageIter *arr, TrayNode *parent, int depth, int *budget)
 {
 	TrayNode *head = NULL, *last = NULL;
 
+	if (depth > 8 || (budget && *budget <= 0))
+		return NULL;
 	while (dbus_message_iter_get_arg_type(arr) == DBUS_TYPE_VARIANT ||
 	    dbus_message_iter_get_arg_type(arr) == DBUS_TYPE_STRUCT) {
 		DBusMessageIter st, dict, kids, prop, ent;
 		TrayNode *n = calloc(1, sizeof(*n));
+		int has_toggle = 0, toggle_state = 0;
+
+		if (budget)
+			(*budget)--;
+		if (budget && *budget <= 0) {
+			free(n);
+			break;
+		}
 
 		n->parent = parent;
 		n->enabled = 1;
@@ -11825,13 +11842,12 @@ tray_parse_items(DBusMessageIter *arr, TrayNode *parent)
 						char *s = NULL;
 						dbus_message_iter_get_basic(&val, &s);
 						if (s && s[0])
-							n->checked = 0;
+							has_toggle = 1;
 					} else if (key && strcmp(key, "toggle-state") == 0 &&
 					    dbus_message_iter_get_arg_type(&val) == DBUS_TYPE_INT32) {
 						int sti = 0;
 						dbus_message_iter_get_basic(&val, &sti);
-						if (n->checked >= 0)
-							n->checked = sti;
+						toggle_state = sti;
 					} else if (key && strcmp(key, "type") == 0 &&
 					    dbus_message_iter_get_arg_type(&val) == DBUS_TYPE_STRING) {
 						char *s = NULL;
@@ -11846,13 +11862,18 @@ tray_parse_items(DBusMessageIter *arr, TrayNode *parent)
 				if (!dbus_message_iter_next(&prop))
 					break;
 			}
+			/* toggle-type may come before or after toggle-state in the
+			 * dict (bus order is arbitrary); resolve only once both are
+			 * seen. */
+			if (has_toggle)
+				n->checked = toggle_state;
 		}
 
 		/* children array */
 		if (dbus_message_iter_next(&st) &&
 		    dbus_message_iter_get_arg_type(&st) == DBUS_TYPE_ARRAY) {
 			dbus_message_iter_recurse(&st, &kids);
-			n->children = tray_parse_items(&kids, n);
+			n->children = tray_parse_items(&kids, n, depth + 1, budget);
 		}
 
 		if (!n->label) {
@@ -11906,7 +11927,7 @@ tray_fetch_menu(TrayItem *it)
 			DBUS_TYPE_ARRAY, DBUS_TYPE_STRING, &empty, n,
 			DBUS_TYPE_INVALID);
 	}
-	reply = dbus_connection_send_with_reply_and_block(tray_dbus, msg, 2000, NULL);
+	reply = dbus_connection_send_with_reply_and_block(tray_dbus, msg, 1000, NULL);
 	dbus_message_unref(msg);
 	if (!reply) {
 		tbwm_log(TBWM_LOG_DEBUG, "tray: %s: GetLayout failed\n", it->display);
@@ -11929,9 +11950,10 @@ tray_fetch_menu(TrayItem *it)
 					dbus_message_iter_next(&layout);
 				/* av of child items, each a variant wrapping a struct */
 				if (dbus_message_iter_get_arg_type(&layout) == DBUS_TYPE_ARRAY) {
+					int budget = 512;
 					dbus_message_iter_recurse(&layout, &arr);
 					it->menuroot = calloc(1, sizeof(*it->menuroot));
-					it->menuroot->children = tray_parse_items(&arr, it->menuroot);
+					it->menuroot->children = tray_parse_items(&arr, it->menuroot, 0, &budget);
 					for (c = it->menuroot->children; c; c = c->sibling)
 						it->menuroot->child_count++;
 				}
@@ -11982,7 +12004,7 @@ tray_prop_get(TrayItem *it, const char *prop)
 		DBUS_TYPE_STRING, &iface,
 		DBUS_TYPE_STRING, &prop,
 		DBUS_TYPE_INVALID);
-	reply = dbus_connection_send_with_reply_and_block(tray_dbus, msg, 2000, NULL);
+	reply = dbus_connection_send_with_reply_and_block(tray_dbus, msg, 1000, NULL);
 	dbus_message_unref(msg);
 	return reply;
 }
@@ -12233,10 +12255,24 @@ retry:
 static void
 tray_resolve_items(void)
 {
+	static TrayItem *next = NULL;
 	TrayItem *it;
 
-	for (it = tray_items; it; it = it->next)
+	if (!next || next->dead) {
+		next = tray_items;
+		if (!next)
+			return;
+	}
+	for (it = next; it; it = it->next) {
+		next = it;
+		if (it->resolved || it->dead)
+			continue;
 		tray_resolve_one(it);
+		next = it->next ? it->next : tray_items;
+		break;
+	}
+	if (!it)
+		next = tray_items;
 }
 
 static void
@@ -12428,9 +12464,11 @@ tray_visible_count(void)
 		tray_cur_node = tray_cur_item->menuroot;
 	{
 		TrayNode *ch;
+		/* Count physical rows: separators occupy a row too so navigation,
+		 * the renderer and the menu height all use the same index. */
 		for (ch = tray_cur_node ? tray_cur_node->children : NULL; ch;
 		     ch = ch->sibling)
-			if (ch->is_visible && !ch->is_sep)
+			if (ch->is_visible)
 				c++;
 	}
 	return c;
@@ -12440,7 +12478,7 @@ static TrayNode *
 tray_row_node(int row, int *was_sep)
 {
 	TrayNode *ch;
-	int i = 0, vis = 0;
+	int i = 0;
 	if (was_sep)
 		*was_sep = 0;
 	if (tray_level == 0)
@@ -12452,14 +12490,11 @@ tray_row_node(int row, int *was_sep)
 	for (ch = tray_cur_node ? tray_cur_node->children : NULL; ch; ch = ch->sibling) {
 		if (!ch->is_visible)
 			continue;
-		if (ch->is_sep) {
-			if (was_sep && i == row)
-				*was_sep = 1;
-			continue;
-		}
-		if (vis == row)
+		if (i == row) {
+			if (was_sep)
+				*was_sep = ch->is_sep;
 			return ch;
-		vis++;
+		}
 		i++;
 	}
 	return NULL;
@@ -12480,8 +12515,7 @@ tray_enter_row(int row)
 			return;
 		if (p->dead) {
 			/* Owner vanished; don't block on D-Bus calls to a dead service. */
-			traymenu_active = 0;
-			tray_level = 0;
+			tray_menu_reset();
 			updatetraymenu();
 			updatebars();
 			return;
@@ -12536,6 +12570,8 @@ tray_enter_row(int row)
 		TrayNode *child = tray_row_node(row, NULL);
 		if (!child)
 			return;
+		if (child->is_sep)
+			return; /* separators occupy a row but aren't selectable */
 		if (child->child_count > 0 && child->children) {
 			tray_cur_node = child;
 			tray_level++;
@@ -12550,8 +12586,7 @@ tray_enter_row(int row)
 			tray_activate_app(tray_cur_item);
 		else
 			tray_activate_node(tray_cur_item, child);
-		traymenu_active = 0;
-		tray_level = 0;
+		tray_menu_reset();
 		updatetraymenu();
 		updatebars();
 	}
@@ -12736,7 +12771,7 @@ updatetraymenu(void)
 		}
 	} else {
 		TrayNode *ch;
-		int r = 0, vis = 0;
+		int r = 0;
 		if (!tray_cur_node && tray_cur_item)
 			tray_cur_node = tray_cur_item->menuroot;
 		for (ch = tray_cur_node ? tray_cur_node->children : NULL; ch;
@@ -12749,7 +12784,6 @@ updatetraymenu(void)
 			}
 			if (cur_row >= content_rows)
 				break;
-			vis = r;
 			if (ch->is_sep) {
 				int ci;
 				int text_y = (r - tray_scroll + 1) * cell_height;
@@ -12757,12 +12791,11 @@ updatetraymenu(void)
 					render_char_to_buffer(pixels, menu_width, menu_height,
 						cell_width + ci * cell_width, text_y, 0x2500,
 						text_color);
-				r++;
-				continue;
+			} else {
+				tray_menu_row(pixels, menu_width, menu_height, cur_row,
+					ch->label, (r == tray_row), ch->child_count > 0,
+					ch->checked > 0, text_color, hi_bg, hi_fg);
 			}
-			tray_menu_row(pixels, menu_width, menu_height, cur_row,
-				ch->label, (vis == tray_row), ch->child_count > 0,
-				ch->checked > 0, text_color, hi_bg, hi_fg);
 			cur_row++;
 			r++;
 		}
@@ -12782,12 +12815,25 @@ updatetraymenu(void)
 
 /* ---- toggle / keyboard ---- */
 
+/* Fully close the tray menu and drop all navigation state so
+ * tray_cur_item/tray_cur_node never linger pointing at menu trees that may
+ * later be freed by tray_prune_dead(). */
+static void
+tray_menu_reset(void)
+{
+	traymenu_active = 0;
+	tray_level = 0;
+	tray_row = 0;
+	tray_scroll = 0;
+	tray_cur_item = NULL;
+	tray_cur_node = NULL;
+}
+
 static void
 toggletraymenu(const Arg *arg)
 {
 	if (traymenu_active) {
-		traymenu_active = 0;
-		tray_level = 0;
+		tray_menu_reset();
 		updatetraymenu();
 		updatebars();
 		return;
@@ -12817,7 +12863,7 @@ traymenu_key(xkb_keysym_t sym)
 			tray_row = 0;
 			tray_scroll = 0;
 		} else {
-			traymenu_active = 0;
+			tray_menu_reset();
 		}
 		updatetraymenu();
 		updatebars();
@@ -13001,70 +13047,6 @@ out:
 	signal(sig, SIG_DFL);
 	raise(sig);
 	_exit(128 + sig);
-}
-
-/* Hang watchdog: if the main event loop does not advance for
- * TBWM_HANG_TIMEOUT_S seconds, the main thread is stuck (the timing timer,
- * which rearms the watchdog, is no longer running). SIGALRM interrupts
- * whatever it is stuck in and we dump a backtrace to a persistent file before
- * turning it into a SIGABRT so the crash handler also runs. All operations
- * here are async-signal-safe. */
-static void
-hang_handler(int sig)
-{
-	void *frames[64];
-	int n = backtrace(frames, 64), fd;
-	const char *msg = "\n=== tbwm HANG (event loop stuck) ===\n";
-
-	(void)sig;
-	dprintf(2, "%s", msg);
-	fd = open(TBWM_HANG_LOG, O_WRONLY | O_CREAT | O_APPEND, 0644);
-	if (fd < 0)
-		return;
-	dprintf(fd, "\n=== tbwm HANG at %ld ===\n", (long)time(NULL));
-	backtrace_symbols_fd(frames, n, fd);
-	close(fd);
-
-	/* Fold the hang into the normal crash path (re-raise -> SIGABRT). */
-	raise(SIGABRT);
-}
-
-/* Rearm the watchdog so it fires only when the event loop stops advancing. */
-static void
-hang_watchdog_kick(void)
-{
-	struct itimerspec its;
-
-	if (hang_watchdog == (timer_t)0)
-		return;
-	its.it_value.tv_sec = TBWM_HANG_TIMEOUT_S;
-	its.it_value.tv_nsec = 0;
-	its.it_interval.tv_sec = 0;
-	its.it_interval.tv_nsec = 0;
-	timer_settime(hang_watchdog, 0, &its, NULL);
-}
-
-static void
-install_hang_watchdog(void)
-{
-	struct sigevent sev;
-	struct sigaction sa;
-
-	memset(&sev, 0, sizeof(sev));
-	sev.sigev_notify = SIGEV_SIGNAL;
-	sev.sigev_signo = SIGALRM;
-	if (timer_create(CLOCK_MONOTONIC, &sev, &hang_watchdog) != 0) {
-		tbwm_log(TBWM_LOG_WARN, "tbwm: warning: hang watchdog unavailable: %s\n",
-			strerror(errno));
-		hang_watchdog = (timer_t)0;
-		return;
-	}
-	memset(&sa, 0, sizeof(sa));
-	sa.sa_handler = hang_handler;
-	sigemptyset(&sa.sa_mask);
-	sa.sa_flags = 0; /* no SA_RESTART: interrupt the stuck syscall */
-	sigaction(SIGALRM, &sa, NULL);
-	hang_watchdog_kick();
 }
 
 static void
