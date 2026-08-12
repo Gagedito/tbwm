@@ -35,6 +35,10 @@ XLIBS = xcb xcb-icccm
 # gmake default 'CC=c99', we use cc.
 CC = cc
 
+# System tray (StatusNotifierItem/DBusMenu) support for the [S] menu
+# (Discord/Spotify/Steam minimized-background apps). Requires libdbus-1.
+DBUS_PKG = dbus-1
+
 # Optional keyboard layout override, selectable at install time:
 #   TBWM_XKB_LAYOUT=latam make
 # (Uses CFLAGS because the Makefile redefines TBWMCPPFLAGS after including us.)
