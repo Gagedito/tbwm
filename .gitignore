@@ -1,3 +1,8 @@
 *.o
 *-protocol.h
 /tbwm
+/profile.log
+/logger
+/tbwm-crash.log
+tbwm-*.tar.gz
+tbwm-*/
