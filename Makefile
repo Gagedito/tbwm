@@ -9,7 +9,7 @@ TBWMCPPFLAGS = -I. -DWLR_USE_UNSTABLE -D_POSIX_C_SOURCE=200809L \
 TBWMDEVCFLAGS = -g -Wpedantic -Wall -Wextra -Wdeclaration-after-statement \
 	-Wno-unused-parameter -Wshadow -Wunused-macros -Werror=strict-prototypes \
 	-Werror=implicit -Werror=return-type -Werror=incompatible-pointer-types \
-	-Wfloat-conversion
+	-Wfloat-conversion -Wformat=2 -Wformat-security -Warray-bounds
 
 # CFLAGS / LDFLAGS
 PKGS      = wayland-server xkbcommon libinput freetype2 pixman-1 $(XLIBS) $(DBUS_PKG)
@@ -57,9 +57,9 @@ clean:
 
 dist: clean
 	mkdir -p tbwm-$(VERSION)
-	cp -R LICENSE* Makefile CHANGELOG.md README.md client.h config.def.h \
+	cp -R LICENSE* Makefile README.md client.h config.def.h \
 		config.mk protocols tbwm.1 tbwm.c util.c util.h tbwm.desktop \
-		tbwm-$(VERSION)
+		s7.c s7.h bluetooth.c bluetooth.h tbwm-$(VERSION)
 	tar -caf tbwm-$(VERSION).tar.gz tbwm-$(VERSION)
 	rm -rf tbwm-$(VERSION)
 

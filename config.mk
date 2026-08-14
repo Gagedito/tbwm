@@ -24,9 +24,8 @@ WLR_LIBS = `$(PKG_CONFIG) --libs wlroots-0.19`
 #	-I$(PWD)/wlroots/0.19/include/wlroots-0.19
 #WLR_LIBS = -Wl,-rpath,$(PWD)/wlroots/0.19/lib64 -L$(PWD)/wlroots/0.19/lib64 -lwlroots-0.19
 
-XWAYLAND =
-XLIBS =
-# Uncomment to build XWayland support
+# XWayland support. Set XWAYLAND= (empty) on the make command line to disable,
+# e.g.  make XWAYLAND=   (the CI workflow does this).
 XWAYLAND = -DXWAYLAND
 XLIBS = xcb xcb-icccm
 
