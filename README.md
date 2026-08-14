@@ -5,6 +5,10 @@
 
 a dynamic tiling wayland compositor with shitty scheme scripting
 
+> La documentación canónica de este fork es
+> [`Gagedito/tbwm-fixes`](https://github.com/Gagedito/tbwm-fixes) (README y
+> `docs/`); este README es solo el resumen rápido.
+
 features:
 - scheme configuration: lots configurable at runtime via ~/.config/tbwm/config.scm (not that good tho)
 - launcher: you can press super+d for application launcher. i should probably make it a seperate app but like uhuhuj
@@ -36,7 +40,8 @@ dependencies:
 - wlroots 0.19+
 - wayland, wayland-protocols
 - libinput, xkbcommon
-- freetype2, pangocairo
+- freetype2, pixman
+- dbus (system tray)
 - libxcb, xcb-icccm (for XWayland)
 
 ```bash
