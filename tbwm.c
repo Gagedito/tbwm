@@ -475,7 +475,23 @@ static void togglethememenu(const Arg *arg);
 static int thememenu_key(xkb_keysym_t sym);
 static void updatethememenu(void);
 static void theme_persist(void);
+static void thememenu_close(void);
+static int thememenu_item_count(void);
+static void thememenu_activate(int selected);
+static int thememenu_geom(int *mx, int *my, int *mw, int *mh);
 static s7_pointer scm_toggle_thememenu(s7_scheme *sc, s7_pointer args);
+static void togglemonitormenu(const Arg *arg);
+static int monitormenu_key(xkb_keysym_t sym);
+static void updatemonitormenu(void);
+static int monitormenu_items(void);
+static void monitormenu_activate(int selected);
+static int monitormenu_geom(int *mx, int *my, int *mw, int *mh);
+static s7_pointer scm_toggle_monitormenu(s7_scheme *sc, s7_pointer args);
+static void apply_display_rules(void);
+static s7_pointer scm_define_output_rule(s7_scheme *sc, s7_pointer args);
+static int monitor_in_mons(Monitor *target);
+static int monitormenu_target_valid(void);
+static void display_persist(void);
  static void toggletraymenu(const Arg *arg);
  static int traymenu_key(xkb_keysym_t sym);
 static void updatetraymenu(void);
@@ -872,6 +888,34 @@ static int thememenu_hex_active = 0; /* 1 = typing a custom hex even if the buff
 static int thememenu_alpha_active = 0; /* 1 = typing a custom alpha percentage */
 static char thememenu_alpha_buf[4];   /* 0-100, up to 3 digits + NUL */
 static int thememenu_alpha_len = 0;
+
+/* Display menu (M-P): a native list of the connected monitors with per-output
+ * actions (No usar / Duplicado / Individual), modeled on the theme menu. */
+#define MONITORMENU_ACTION_OFF  1
+#define MONITORMENU_ACTION_MIRROR 2
+#define MONITORMENU_ACTION_INDIVIDUAL 3
+#define MONITORMENU_ACTION_PRIMARY 4
+#define MONITORMENU_ACTION_SECONDARY 5
+#define OUTPUT_RULE_NAMESIZE 32
+#define OUTPUT_RULE_MAX 16
+struct OutputRule {
+	char name[OUTPUT_RULE_NAMESIZE];
+	int mode;     /* 0 none, 1 off, 2 mirror, 3 individual */
+	int primary;  /* 1 = this output is the principal */
+};
+static struct wlr_scene_buffer *monitormenu_buffer = NULL;
+static struct TitleBuffer *monitormenu_tb = NULL;  /* cached buffer for reuse */
+static int monitormenu_active = 0;
+static int monitormenu_scroll_offset = 0;
+static int monitormenu_selected_row = 0;
+static Monitor *monitormenu_target = NULL; /* output being configured */
+static Monitor *monitormenu_subtarget = NULL; /* secondary being configured from the principal */
+static int monitormenu_action_mode = 0; /* 0 = list, 1 = actions for target, 2 = configure subtarget */
+static Monitor *primary_mon = NULL;   /* the principal output (mirror anchor) */
+static struct OutputRule cfg_output_rules[OUTPUT_RULE_MAX];
+static int cfg_output_rule_count = 0;
+static int display_rules_applying = 0;
+static int display_backend_started = 0; /* set after wlr_backend_start() */
 
 /* Bluetooth pairing lives in bluetooth.c (blt_* API in bluetooth.h): the
  * pairing dialog, the bluetoothcd session (pipes + fd watcher) and the
@@ -2043,6 +2087,58 @@ buttonpress(struct wl_listener *listener, void *data)
 			}
 		}
 
+		/* Handle theme menu clicks */
+		if (thememenu_active && selmon) {
+			int mx, my, mw, mh, rel_y, clicked_row, content_row, selected;
+			if (thememenu_geom(&mx, &my, &mw, &mh) &&
+			    cursor->x >= mx && cursor->x < mx + mw &&
+			    cursor->y >= my && cursor->y < my + mh) {
+				/* Click is inside menu */
+				if (thememenu_hex_active || thememenu_alpha_active)
+					return; /* Consume the click while typing */
+				rel_y = cursor->y - my;
+				clicked_row = rel_y / cell_height;
+				/* Row 0 is title bar, rows 1..mh-2 are content */
+				if (clicked_row >= 1 && clicked_row <= mh / cell_height - 2) {
+					content_row = clicked_row - 1;
+					selected = content_row + thememenu_scroll_offset;
+					if (selected < thememenu_item_count()) {
+						thememenu_selected_row = content_row;
+						thememenu_activate(selected);
+					}
+				}
+				return; /* Consume the click */
+			} else {
+				/* Click outside menu - close it */
+				thememenu_close();
+			}
+		}
+
+		/* Handle monitor menu clicks */
+		if (monitormenu_active && selmon) {
+			int mx, my, mw, mh, rel_y, clicked_row, content_row, selected;
+			if (monitormenu_geom(&mx, &my, &mw, &mh) &&
+			    cursor->x >= mx && cursor->x < mx + mw &&
+			    cursor->y >= my && cursor->y < my + mh) {
+				/* Click is inside menu */
+				rel_y = cursor->y - my;
+				clicked_row = rel_y / cell_height;
+				/* Row 0 is title bar, rows 1..mh-2 are content */
+				if (clicked_row >= 1 && clicked_row <= mh / cell_height - 2) {
+					content_row = clicked_row - 1;
+					selected = content_row + monitormenu_scroll_offset;
+					if (selected < monitormenu_items()) {
+						monitormenu_selected_row = content_row;
+						monitormenu_activate(selected);
+					}
+				}
+				return; /* Consume the click */
+			} else {
+				/* Click outside menu - close it */
+				togglemonitormenu(NULL);
+			}
+		}
+
 		/* Handle clicks on the status bar */
 		/* Skip if fullscreen client is focused */
 		fc = focustop(selmon);
@@ -2402,6 +2498,15 @@ cleanup(void)
 		thememenu_tb = NULL;
 	}
 
+	/* Clean up display menu buffer */
+	if (monitormenu_buffer) {
+		wlr_scene_buffer_set_buffer(monitormenu_buffer, NULL);
+	}
+	if (monitormenu_tb) {
+		wlr_buffer_drop(&monitormenu_tb->base);
+		monitormenu_tb = NULL;
+	}
+
 	/* Clean up tray menu buffer */
 	if (traymenu_buffer) {
 		wlr_scene_buffer_set_buffer(traymenu_buffer, NULL);
@@ -2508,6 +2613,14 @@ cleanupmon(struct wl_listener *listener, void *data)
 	wl_list_remove(&m->frame.link);
 	wl_list_remove(&m->link);
 	wl_list_remove(&m->request_state.link);
+
+	/* Clear display-menu state pointing at the removed output */
+	if (m == primary_mon)
+		primary_mon = NULL;
+	if (m == monitormenu_target)
+		monitormenu_target = NULL;
+	if (m == monitormenu_subtarget)
+		monitormenu_subtarget = NULL;
 	if (m->lock_surface)
 		destroylocksurface(&m->destroy_lock_surface, NULL);
 	m->wlr_output->data = NULL;
@@ -2936,6 +3049,12 @@ createmon(struct wl_listener *listener, void *data)
 		wlr_output_layout_add_auto(output_layout, wlr_output);
 	else
 		wlr_output_layout_add(output_layout, wlr_output, m->m.x, m->m.y);
+
+	/* Re-apply saved display rules (display.scm) on hotplug so a replugged
+	 * output gets its remembered mode/role back. Skipped during the initial
+	 * backend enumeration (run() applies the rules once the backend is up). */
+	if (display_backend_started)
+		apply_display_rules();
 }
 
 void
@@ -6741,6 +6860,8 @@ keybinding(uint32_t mods, xkb_keysym_t sym)
 		return 1;
 	if (thememenu_active && thememenu_key(sym))
 		return 1;
+	if (monitormenu_active && monitormenu_key(sym))
+		return 1;
 	if (traymenu_active && traymenu_key(sym))
 		return 1;
 
@@ -7199,6 +7320,48 @@ motionnotify(uint32_t time, struct wlr_input_device *device, double dx, double d
 					if (new_selected != audio_selected_row && new_selected < audiomenu_item_count()) {
 						audio_selected_row = new_selected;
 						updatemenuaudio();
+					}
+				}
+			}
+		}
+
+		/* Update theme menu hover selection */
+		if (thememenu_active && selmon && !thememenu_hex_active &&
+		    !thememenu_alpha_active) {
+			int mx, my, mw, mh;
+			if (thememenu_geom(&mx, &my, &mw, &mh) &&
+			    cursor->x >= mx && cursor->x < mx + mw &&
+			    cursor->y >= my && cursor->y < my + mh) {
+				int rel_y = (int)(cursor->y - my);
+				int hovered_row = rel_y / cell_height;
+				/* Row 0 is title bar, rows 1..mh-2 are content */
+				if (hovered_row >= 1 && hovered_row <= mh / cell_height - 2) {
+					int new_selected = hovered_row - 1;
+					if (new_selected != thememenu_selected_row &&
+					    new_selected < thememenu_item_count()) {
+						thememenu_selected_row = new_selected;
+						updatethememenu();
+					}
+				}
+			}
+		}
+
+		/* Update monitor menu hover selection */
+		if (monitormenu_active && selmon) {
+			int mx, my, mw, mh;
+			if (monitormenu_geom(&mx, &my, &mw, &mh) &&
+			    cursor->x >= mx && cursor->x < mx + mw &&
+			    cursor->y >= my && cursor->y < my + mh) {
+				int rel_y = (int)(cursor->y - my);
+				int hovered_row = rel_y / cell_height;
+				/* Row 0 is title bar, rows 1..mh-2 are content */
+				if (hovered_row >= 1 && hovered_row <= mh / cell_height - 2) {
+					int new_selected = hovered_row - 1;
+					if (new_selected != monitormenu_selected_row &&
+					    new_selected + monitormenu_scroll_offset <
+						monitormenu_items()) {
+						monitormenu_selected_row = new_selected;
+						updatemonitormenu();
 					}
 				}
 			}
@@ -7709,6 +7872,7 @@ run(char *startup_cmd)
 	 * master, etc */
 	if (!wlr_backend_start(backend))
 		die("startup: backend_start");
+	display_backend_started = 1;
 
 	/* Now that the socket exists and the backend is started, run the startup command */
 	if (startup_cmd) {
@@ -7739,9 +7903,16 @@ run(char *startup_cmd)
 
 	printstatus();
 
-	/* At this point the outputs are initialized, choose initial selmon based on
-	 * cursor position, and set default cursor image */
+	/* At this point the outputs are initialized, apply the saved display rules
+	 * (display.scm) now that the backend has created them */
+	apply_display_rules();
+
+	/* choose initial selmon based on cursor position (preferring the principal),
+	 * and set default cursor image */
 	selmon = xytomon(cursor->x, cursor->y);
+	if (primary_mon && primary_mon->wlr_output->enabled &&
+	    monitor_in_mons(primary_mon))
+		selmon = primary_mon;
 
 	/* TODO hack to get cursor to display in its initial location (100, 100)
 	 * instead of (0, 0) and then jumping. Still may not be fully
@@ -9503,6 +9674,8 @@ setup_scheme(void)
 	s7_define_function(sc, "set-audio-menu-button", scm_set_audio_menu_button, 1, 0, false, "(set-audio-menu-button \"text\") set audio menu button label in bar");
 	s7_define_function(sc, "set-settings-menu-button", scm_set_settings_menu_button, 1, 0, false, "(set-settings-menu-button \"text\") set settings menu button label in bar");
 	s7_define_function(sc, "toggle-thememenu", scm_toggle_thememenu, 0, 0, false, "(toggle-thememenu) toggle the in-wm color theme menu");
+	s7_define_function(sc, "toggle-monitormenu", scm_toggle_monitormenu, 0, 0, false, "(toggle-monitormenu) toggle the in-wm monitor/screen menu (M-P)");
+	s7_define_function(sc, "define-output-rule", scm_define_output_rule, 2, 0, true, "(define-output-rule \"NAME\" 'mode [#t]) define a persistent display rule (off/mirror/individual, optional primary flag)");
 	s7_define_function(sc, "toggle-settings-menu", scm_toggle_tray_menu, 0, 0, false, "(toggle-settings-menu) toggle the in-wm tray menu (minimized apps / [S])");
 	s7_define_function(sc, "set-tag-count", scm_set_tag_count, 1, 0, false, "(set-tag-count n) set number of virtual desktops (1-9)");
 	s7_define_function(sc, "set-show-time", scm_set_show_time, 1, 0, false, "(set-show-time b) show/hide time in status bar");
@@ -9629,6 +9802,9 @@ static const char *default_config_parts[] = {
 "\n"
 ";; Theme menu (in-WM): frame/bar/background colors, palette or custom\n"
 "(bind-key \"M-t\" (lambda () (toggle-thememenu)))\n"
+"\n"
+";; Monitor menu (in-WM): connected screens -> No usar / Duplicado / Individual\n"
+"(bind-key \"M-P\" (lambda () (toggle-monitormenu)))\n"
 "\n"
 ";; Close window\n"
 "(bind-key \"M-q\" (lambda () (kill-client)))\n"
@@ -9826,6 +10002,22 @@ load_config(void)
 				s7_load(sc, tpath);
 			}
 		}
+		/* Apply saved display config (from M-P menu) after the main config */
+		cfg_output_rule_count = 0; /* reset rules before re-loading them */
+		{
+			char dpath[1024];
+			FILE *df;
+			snprintf(dpath, sizeof(dpath), "%s/display.scm", dir);
+			df = fopen(dpath, "r");
+			if (df) {
+				fclose(df);
+				tbwm_log(TBWM_LOG_INFO, "tbwm: applying saved display config from %s\n", dpath);
+				s7_load(sc, dpath);
+			}
+		}
+		/* Apply the saved rules to the connected outputs (no-op at cold start
+		 * before the backend has created any output; run() re-applies later) */
+		apply_display_rules();
 		/* Ensure arrow swap bindings exist (guard against config truncation/parsing issues) */
 		file_debug_log("tbwm-scm: ensuring M-S-Left/Right/Up/Down are bound\n");
 		s7_eval_c_string(sc, "(bind-key \"M-S-Left\" (lambda () (swap-dir DIR-LEFT)))");
@@ -11385,13 +11577,12 @@ updatethememenu(void)
 {
 	struct TitleBuffer *tb;
 	uint32_t *pixels;
-	int menu_cells_w = 16;
-	int menu_cells_h = (thememenu_palette_mode || thememenu_alpha_mode) ? 20 : 10;
+	int menu_cells_w, menu_cells_h;
 	int menu_width, menu_height;
+	int items, content_rows, footer_row, maxlen = 0;
 	int i, x, y, col, row, cur_row = 0, ci;
 	uint32_t frame_bg, line_color, content_bg, text_color, hi_bg, hi_fg;
 	char title[40];
-	int content_rows = menu_cells_h - 2;
 	Monitor *m;
 
 	if (!thememenu_active) {
@@ -11403,6 +11594,62 @@ updatethememenu(void)
 	if (!m)
 		return;
 
+	/* Dynamic spacing: the menu auto-sizes to its content. Width fits the
+	 * longest label (plus swatch and borders), height fits the items plus an
+	 * optional footer row for the hex/alpha entry hint. */
+	items = thememenu_item_count();
+	footer_row = thememenu_palette_mode ||
+		(thememenu_alpha_mode && thememenu_alpha_active);
+	if (!thememenu_palette_mode && !thememenu_alpha_mode) {
+		for (i = 0; i < THEME_TARGET_COUNT; i++) {
+			int l = (int)strlen(themetarget_names[i]);
+			if (l > maxlen)
+				maxlen = l;
+		}
+	} else if (thememenu_alpha_mode) {
+		for (i = 0; i < THEME_ALPHA_COUNT; i++) {
+			char label[20];
+			int l;
+			snprintf(label, sizeof(label), "Alpha %d%%",
+				themealphas[i] * 100 / 255);
+			l = (int)strlen(label);
+			if (l > maxlen)
+				maxlen = l;
+		}
+		if ((int)strlen("Custom") > maxlen)
+			maxlen = (int)strlen("Custom");
+	} else {
+		for (i = 0; i < THEME_PALETTE_COUNT; i++) {
+			int l = (int)strlen(themepalette_names[i]);
+			if (l > maxlen)
+				maxlen = l;
+		}
+		if ((int)strlen("Custom") > maxlen)
+			maxlen = (int)strlen("Custom");
+		if ((int)strlen("Alpha...") > maxlen)
+			maxlen = (int)strlen("Alpha...");
+	}
+	menu_cells_w = maxlen + 6;
+	if (menu_cells_w < 16)
+		menu_cells_w = 16;
+	if (menu_cells_w > 40)
+		menu_cells_w = 40;
+	{
+		int cap = m->m.width / cell_width - 2;
+		if (cap < 10)
+			cap = 10;
+		if (menu_cells_w > cap)
+			menu_cells_w = cap;
+	}
+	menu_cells_h = items + 2 + (footer_row ? 1 : 0);
+	{
+		int cap = m->m.height / cell_height - 1;
+		if (cap < 5)
+			cap = 5;
+		if (menu_cells_h > cap)
+			menu_cells_h = cap;
+	}
+	content_rows = menu_cells_h - 2;
 	menu_width  = menu_cells_w * cell_width;
 	menu_height = menu_cells_h * cell_height;
 	frame_bg   = premul_argb(cfg_border_color);
@@ -11611,6 +11858,83 @@ thememenu_close(void)
 	updatebars();
 }
 
+/* Number of rows in the current theme menu level. */
+static int
+thememenu_item_count(void)
+{
+	return thememenu_alpha_mode
+		? (THEME_ALPHA_COUNT + 1)
+		: (thememenu_palette_mode
+			? (THEME_PALETTE_COUNT + 2)
+			: THEME_TARGET_COUNT);
+}
+
+/* Activate the item at absolute index `selected` (what Enter does). */
+static void
+thememenu_activate(int selected)
+{
+	if (!thememenu_palette_mode && !thememenu_alpha_mode) {
+		if (selected >= 0 && selected < THEME_TARGET_COUNT)
+			thememenu_open_palette(selected);
+		return;
+	}
+	if (thememenu_alpha_mode) {
+		/* Apply the selected transparency to the current color */
+		if (selected >= 0 && selected < THEME_ALPHA_COUNT) {
+			uint32_t cur = thememenu_target_color(thememenu_target);
+			uint32_t rgb = (cur & 0x00FFFFFF) |
+				(((uint32_t)themealphas[selected]) << 24);
+			thememenu_apply_rgb(rgb);
+		} else if (selected == THEME_ALPHA_COUNT) {
+			/* Custom: type any 0-100% */
+			thememenu_alpha_active = 1;
+			thememenu_alpha_len = 0;
+			thememenu_alpha_buf[0] = '\0';
+		}
+		updatethememenu();
+		return;
+	}
+	/* palette level */
+	if (selected < THEME_PALETTE_COUNT) {
+		thememenu_apply_rgb(themepalette_rgb[selected] | 0xFF000000);
+		updatethememenu();
+		return;
+	}
+	if (selected == THEME_PALETTE_COUNT + 1) {
+		/* Alpha...: edit transparency of the current color */
+		thememenu_alpha_mode = 1;
+		thememenu_reset_nav();
+		updatethememenu();
+		return;
+	}
+	/* Custom entry: start with the current value as a seed */
+	{
+		uint32_t cur = thememenu_target_color(thememenu_target);
+		thememenu_hex_active = 1;
+		if (((cur >> 24) & 0xFF) == 0xFF) {
+			snprintf(thememenu_hex, sizeof(thememenu_hex), "%06x", cur & 0x00FFFFFF);
+			thememenu_hex_len = 6;
+		} else {
+			snprintf(thememenu_hex, sizeof(thememenu_hex), "%08x", cur);
+			thememenu_hex_len = 8;
+		}
+		updatethememenu();
+	}
+}
+
+/* Screen rect occupied by the theme menu (from the last render). */
+static int
+thememenu_geom(int *mx, int *my, int *mw, int *mh)
+{
+	if (!thememenu_buffer || !thememenu_tb)
+		return 0;
+	*mx = (int)thememenu_buffer->node.x;
+	*my = (int)thememenu_buffer->node.y;
+	*mw = (int)thememenu_tb->base.width;
+	*mh = (int)thememenu_tb->base.height;
+	return 1;
+}
+
 static void
 togglethememenu(const Arg *arg)
 {
@@ -11629,7 +11953,7 @@ togglethememenu(const Arg *arg)
 static int
 thememenu_key(xkb_keysym_t sym)
 {
-	int items, max_row, selected;
+	int items, max_row;
 	int content_rows = 24;
 
 	/* Custom hex input mode: consume printable characters */
@@ -11743,11 +12067,7 @@ thememenu_key(xkb_keysym_t sym)
 		return 1;
 	}
 	if (sym == XKB_KEY_Down || sym == XKB_KEY_j) {
-		items = thememenu_alpha_mode
-			? (THEME_ALPHA_COUNT + 1)
-			: (thememenu_palette_mode
-				? (THEME_PALETTE_COUNT + 2)
-				: THEME_TARGET_COUNT);
+		items = thememenu_item_count();
 		max_row = (items < content_rows) ? items - 1 : content_rows - 1;
 		if (thememenu_selected_row < max_row)
 			thememenu_selected_row++;
@@ -11756,55 +12076,7 @@ thememenu_key(xkb_keysym_t sym)
 	}
 	if (sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter ||
 	    sym == XKB_KEY_Right || sym == XKB_KEY_l) {
-		selected = thememenu_selected_row + thememenu_scroll_offset;
-		if (!thememenu_palette_mode && !thememenu_alpha_mode) {
-			if (selected >= 0 && selected < THEME_TARGET_COUNT) {
-				thememenu_open_palette(selected);
-			}
-			return 1;
-		}
-		if (thememenu_alpha_mode) {
-			/* Apply the selected transparency to the current color */
-			if (selected >= 0 && selected < THEME_ALPHA_COUNT) {
-				uint32_t cur = thememenu_target_color(thememenu_target);
-				uint32_t rgb = (cur & 0x00FFFFFF) |
-					(((uint32_t)themealphas[selected]) << 24);
-				thememenu_apply_rgb(rgb);
-			} else if (selected == THEME_ALPHA_COUNT) {
-				/* Custom: type any 0-100% */
-				thememenu_alpha_active = 1;
-				thememenu_alpha_len = 0;
-				thememenu_alpha_buf[0] = '\0';
-			}
-			updatethememenu();
-			return 1;
-		}
-		/* palette level */
-		if (selected < THEME_PALETTE_COUNT) {
-			thememenu_apply_rgb(themepalette_rgb[selected] | 0xFF000000);
-			updatethememenu();
-			return 1;
-		}
-		if (selected == THEME_PALETTE_COUNT + 1) {
-			/* Alpha...: edit transparency of the current color */
-			thememenu_alpha_mode = 1;
-			thememenu_reset_nav();
-			updatethememenu();
-			return 1;
-		}
-		/* Custom entry: start with the current value as a seed */
-		{
-			uint32_t cur = thememenu_target_color(thememenu_target);
-			thememenu_hex_active = 1;
-			if (((cur >> 24) & 0xFF) == 0xFF) {
-				snprintf(thememenu_hex, sizeof(thememenu_hex), "%06x", cur & 0x00FFFFFF);
-				thememenu_hex_len = 6;
-			} else {
-				snprintf(thememenu_hex, sizeof(thememenu_hex), "%08x", cur);
-				thememenu_hex_len = 8;
-			}
-			updatethememenu();
-		}
+		thememenu_activate(thememenu_selected_row + thememenu_scroll_offset);
 		return 1;
 	}
 
@@ -11817,6 +12089,928 @@ scm_toggle_thememenu(s7_scheme *sc, s7_pointer args)
 {
 	(void)args;
 	togglethememenu(NULL);
+	return s7_t(sc);
+}
+
+/* ==================== DISPLAY MENU ====================
+ * A native monitor menu (opened with M-P). Level 1 lists every connected
+ * output (the built-in panel is marked "(Interna)") with its role (Principal /
+ * Secundario) and current state. Level 2 shows actions depending on the role:
+ * the Principal configures every other screen one by one and may turn itself
+ * off or demote itself to Secundario; a Secundaria may be turned off or
+ * promoted to Principal. Level 3 (only from the Principal) configures the
+ * chosen secondary: Duplicado (mirror to the principal), Individual (extend)
+ * or No usar. Every change is persisted to display.scm and re-applied on
+ * restart / replug. The buffer/scene handling mirrors the theme menu. */
+
+static int
+monitormenu_count(void)
+{
+	Monitor *m;
+	int n = 0;
+	wl_list_for_each(m, &mons, link)
+		if (!m->wlr_output->non_desktop)
+			n++;
+	return n;
+}
+
+/* Number of rows in the current menu level. */
+static int monitormenu_other_count(void);
+static int
+monitormenu_items(void)
+{
+	int n;
+	if (monitormenu_action_mode == 0)
+		return monitormenu_count();
+	if (monitormenu_action_mode == 2)
+		return 4;
+	if (!monitormenu_target_valid())
+		return 3;
+	if (monitormenu_target == primary_mon) {
+		n = monitormenu_other_count();
+		return n + 3; /* sub-screens + Apagar principal + Pasar a Secundario + Volver */
+	}
+	return 3; /* No usar / Principal / Volver */
+}
+
+/* The principal output (when connected) always occupies slot 0; the remaining
+ * outputs follow in connection order. */
+static Monitor *
+monitormenu_output_at(int idx)
+{
+	Monitor *m;
+	int n = 0, skip = 0;
+
+	if (monitor_in_mons(primary_mon)) {
+		if (idx == 0)
+			return primary_mon;
+		skip = 1; /* the principal consumed slot 0 */
+	}
+	wl_list_for_each(m, &mons, link) {
+		if (m->wlr_output->non_desktop || m == primary_mon)
+			continue;
+		if (n++ == idx - skip)
+			return m;
+	}
+	return NULL;
+}
+
+static int
+monitormenu_builtin(Monitor *m)
+{
+	const char *n = m->wlr_output->name;
+	return n && (strncmp(n, "eDP", 3) == 0 || strncmp(n, "LVDS", 4) == 0 ||
+		     strncmp(n, "DSI", 3) == 0 || strncmp(n, "DPI", 3) == 0);
+}
+
+/* Current layout state of an output: OFF (disabled), MIRROR (shares its layout
+ * position with another enabled output) or INDIVIDUAL (extended desktop). */
+static int
+monitormenu_state(Monitor *m)
+{
+	struct wlr_box b = {0}, ob = {0};
+	Monitor *o;
+	if (!m->wlr_output->enabled)
+		return MONITORMENU_ACTION_OFF;
+	wlr_output_layout_get_box(output_layout, m->wlr_output, &b);
+	wl_list_for_each(o, &mons, link) {
+		if (o == m || o->wlr_output->non_desktop || !o->wlr_output->enabled)
+			continue;
+		wlr_output_layout_get_box(output_layout, o->wlr_output, &ob);
+		if (ob.width > 0 && b.x == ob.x && b.y == ob.y)
+			return MONITORMENU_ACTION_MIRROR;
+	}
+	return MONITORMENU_ACTION_INDIVIDUAL;
+}
+
+static int
+monitormenu_is_primary(Monitor *m)
+{
+	return primary_mon != NULL && m == primary_mon;
+}
+
+/* Number of connected outputs other than the principal. */
+static int
+monitormenu_other_count(void)
+{
+	Monitor *m;
+	int n = 0;
+	wl_list_for_each(m, &mons, link)
+		if (!m->wlr_output->non_desktop && m != primary_mon)
+			n++;
+	return n;
+}
+
+static Monitor *
+monitormenu_other_at(int idx)
+{
+	Monitor *m;
+	int n = 0;
+	wl_list_for_each(m, &mons, link) {
+		if (m->wlr_output->non_desktop || m == primary_mon)
+			continue;
+		if (n++ == idx)
+			return m;
+	}
+	return NULL;
+}
+
+/* First enabled output other than `exclude` (or NULL). */
+static Monitor *
+first_enabled_other(Monitor *exclude)
+{
+	Monitor *m;
+	wl_list_for_each(m, &mons, link) {
+		if (m->wlr_output->non_desktop || !m->wlr_output->enabled || m == exclude)
+			continue;
+		return m;
+	}
+	return NULL;
+}
+
+/* Reference for "Duplicado": prefer the principal output. */
+static Monitor *
+monitormenu_anchor(Monitor *target)
+{
+	if (primary_mon && monitor_in_mons(primary_mon) &&
+	    primary_mon != target && primary_mon->wlr_output->enabled)
+		return primary_mon;
+	return first_enabled_other(target);
+}
+
+/* Hand the Principal role to another active output and move focus there. */
+static void
+monitormenu_pass_primary(Monitor *from)
+{
+	Monitor *next = first_enabled_other(from);
+	if (next) {
+		primary_mon = next;
+		selmon = next;
+		focusclient(focustop(selmon), 1);
+	} else {
+		primary_mon = NULL;
+	}
+}
+
+static int
+monitormenu_target_valid(void)
+{
+	Monitor *m;
+	if (!monitormenu_target)
+		return 0;
+	wl_list_for_each(m, &mons, link)
+		if (m == monitormenu_target)
+			return 1;
+	return 0;
+}
+
+static int
+monitormenu_subtarget_valid(void)
+{
+	Monitor *m;
+	if (!monitormenu_subtarget)
+		return 0;
+	wl_list_for_each(m, &mons, link)
+		if (m == monitormenu_subtarget)
+			return 1;
+	return 0;
+}
+
+/* Is `target` currently one of the connected outputs? */
+static int
+monitor_in_mons(Monitor *target)
+{
+	Monitor *m;
+	if (!target)
+		return 0;
+	wl_list_for_each(m, &mons, link)
+		if (m == target)
+			return 1;
+	return 0;
+}
+
+/* Place `m` at the same layout position as `anchor`, i.e. mirror its content.
+ * The layout manipulation must be atomic: wlr_output_layout emits its `change`
+ * signal synchronously, which would run updatemons() mid-operation and re-add
+ * the output with add_auto() at a new position (a runaway cascade). We
+ * temporarily disconnect the change listener, relocate the output (remove +
+ * re-add so it is placed even when already present in the layout), then run
+ * updatemons() exactly once.
+ *
+ * The anchor is pinned as a manually configured output at its current box
+ * first: outputs added with add_auto() are auto-configured, and wlroots'
+ * internal auto-arrangement shoves them aside when another output is manually
+ * stacked on top (driving the two apart instead of mirroring). Pinning the
+ * anchor and re-adding `m` manually leaves no auto-configured output that can
+ * be rearranged, so the overlap is stable. */
+static void
+monitormenu_layout_mirror(Monitor *m, Monitor *anchor)
+{
+	struct wlr_box ab = {0}, res = {0};
+	wlr_output_layout_get_box(output_layout, anchor->wlr_output, &ab);
+	wl_list_remove(&layout_change.link);
+	wlr_output_layout_add(output_layout, anchor->wlr_output, ab.x, ab.y);
+	wlr_output_layout_remove(output_layout, m->wlr_output);
+	wlr_output_layout_add(output_layout, m->wlr_output, ab.x, ab.y);
+	wl_signal_add(&output_layout->events.change, &layout_change);
+	wlr_output_layout_get_box(output_layout, m->wlr_output, &res);
+	tbwm_log(TBWM_LOG_INFO, "tbwm-display: mirror %s -> %s at (%d,%d) now (%d,%d)\n",
+		m->wlr_output->name, anchor->wlr_output->name,
+		ab.x, ab.y, res.x, res.y);
+	updatemons(NULL, NULL);
+}
+
+/* (Re)configure `m` as an independent, auto-arranged output (extended desktop).
+ * Unlike a plain add_auto(), this also works when the output is already in the
+ * layout (e.g. currently stacked as a mirror), and it is atomic so the
+ * synchronous `change` signal cannot run updatemons() mid-operation. */
+static void
+monitormenu_layout_individual(Monitor *m)
+{
+	wl_list_remove(&layout_change.link);
+	wlr_output_layout_add_auto(output_layout, m->wlr_output);
+	wl_signal_add(&output_layout->events.change, &layout_change);
+	updatemons(NULL, NULL);
+}
+
+static void
+monitormenu_apply(Monitor *m, int action)
+{
+	struct wlr_output_state state;
+	struct wlr_output *o = m->wlr_output;
+
+	if (!o)
+		return;
+
+	if (action == MONITORMENU_ACTION_OFF) {
+		int enabled_count = 0;
+		Monitor *it;
+		wl_list_for_each(it, &mons, link)
+			if (!it->wlr_output->non_desktop && it->wlr_output->enabled)
+				enabled_count++;
+		if (enabled_count <= 1)
+			return; /* never blank the last enabled output */
+		wlr_output_state_init(&state);
+		wlr_output_state_set_enabled(&state, 0);
+		wlr_output_commit_state(o, &state);
+		wlr_output_state_finish(&state);
+		if (monitormenu_is_primary(m))
+			monitormenu_pass_primary(m);
+		updatemons(NULL, NULL);
+		display_persist();
+		return;
+	}
+
+	/* Enable with the preferred mode (a disabled output has no mode left) */
+	wlr_output_state_init(&state);
+	wlr_output_state_set_enabled(&state, 1);
+	if (!o->current_mode)
+		wlr_output_state_set_mode(&state, wlr_output_preferred_mode(o));
+	wlr_output_commit_state(o, &state);
+	wlr_output_state_finish(&state);
+
+	if (action == MONITORMENU_ACTION_INDIVIDUAL ||
+	    action == MONITORMENU_ACTION_PRIMARY) {
+		if (action == MONITORMENU_ACTION_PRIMARY)
+			primary_mon = m;
+		monitormenu_layout_individual(m);
+	} else if (action == MONITORMENU_ACTION_MIRROR) {
+		Monitor *anchor = monitormenu_anchor(m);
+		if (anchor)
+			monitormenu_layout_mirror(m, anchor);
+		else
+			monitormenu_layout_individual(m);
+	} else if (action == MONITORMENU_ACTION_SECONDARY) {
+		if (monitormenu_is_primary(m))
+			monitormenu_pass_primary(m);
+	}
+	updatemons(NULL, NULL);
+	display_persist();
+}
+
+/* Persist the current per-output state + roles to display.scm so it is restored
+ * after a restart (load_config loads it and apply_display_rules() re-applies). */
+static void
+display_persist(void)
+{
+	char path[1024], dir[512];
+	const char *home = getenv("HOME");
+	FILE *f;
+	Monitor *m;
+	int i = 0;
+
+	if (!home)
+		return;
+	snprintf(dir, sizeof(dir), "%s/.config/tbwm", home);
+	snprintf(path, sizeof(path), "%s/display.scm", dir);
+	mkdir(dir, 0755);
+
+	f = fopen(path, "w");
+	if (!f) {
+		tbwm_log(TBWM_LOG_WARN, "tbwm-display: could not write %s\n", path);
+		return;
+	}
+	fprintf(f, ";;; Display configuration (M-P menu) - reloaded at startup.\n");
+	cfg_output_rule_count = 0;
+	wl_list_for_each(m, &mons, link) {
+		const char *mode;
+		int st;
+		if (m->wlr_output->non_desktop)
+			continue;
+		if (i >= OUTPUT_RULE_MAX)
+			break;
+		st = monitormenu_state(m);
+		snprintf(cfg_output_rules[i].name, sizeof(cfg_output_rules[i].name),
+			"%s", m->wlr_output->name);
+		cfg_output_rules[i].mode = st;
+		cfg_output_rules[i].primary = monitormenu_is_primary(m);
+		mode = st == MONITORMENU_ACTION_OFF ? "off" :
+		       st == MONITORMENU_ACTION_MIRROR ? "mirror" : "individual";
+		fprintf(f, "(define-output-rule \"%s\" '%s %s)\n",
+			m->wlr_output->name, mode,
+			monitormenu_is_primary(m) ? "#t" : "#f");
+		i++;
+	}
+	cfg_output_rule_count = i;
+	fclose(f);
+	tbwm_log(TBWM_LOG_INFO, "tbwm-display: persisted display config to %s\n", path);
+}
+
+/* Apply the saved output rules to the currently connected outputs. Idempotent:
+ * guarded against recursion (a re-applied rule may toggle an output, which can
+ * itself end up calling back into here). */
+static void
+apply_display_rules(void)
+{
+	Monitor *m, *it;
+	struct wlr_output_state state;
+	int i, changed = 0;
+
+	if (display_rules_applying)
+		return;
+	display_rules_applying = 1;
+
+	/* Pass 1: resolve the principal (first connected output marked primary) */
+	primary_mon = NULL;
+	for (i = 0; i < cfg_output_rule_count && !primary_mon; i++) {
+		if (!cfg_output_rules[i].primary)
+			continue;
+		wl_list_for_each(m, &mons, link)
+			if (!m->wlr_output->non_desktop &&
+			    strcmp(m->wlr_output->name, cfg_output_rules[i].name) == 0) {
+				primary_mon = m;
+				break;
+			}
+	}
+	if (!primary_mon) {
+		wl_list_for_each(m, &mons, link)
+			if (!m->wlr_output->non_desktop && m->wlr_output->enabled) {
+				primary_mon = m;
+				break;
+			}
+	}
+
+	/* Pass 2: enable / disable each rule's output */
+	for (i = 0; i < cfg_output_rule_count; i++) {
+		wl_list_for_each(m, &mons, link) {
+			struct wlr_output *o;
+			if (m->wlr_output->non_desktop)
+				continue;
+			if (strcmp(m->wlr_output->name, cfg_output_rules[i].name) != 0)
+				continue;
+			o = m->wlr_output;
+			if (cfg_output_rules[i].mode == MONITORMENU_ACTION_OFF) {
+				int en = 0;
+				if (!o->enabled)
+					break;
+				wl_list_for_each(it, &mons, link)
+					if (!it->wlr_output->non_desktop && it->wlr_output->enabled)
+						en++;
+				if (en <= 1)
+					break; /* never blank the last enabled output */
+				wlr_output_state_init(&state);
+				wlr_output_state_set_enabled(&state, 0);
+				wlr_output_commit_state(o, &state);
+				wlr_output_state_finish(&state);
+				changed = 1;
+			} else if (!o->enabled) {
+				wlr_output_state_init(&state);
+				wlr_output_state_set_enabled(&state, 1);
+				if (!o->current_mode)
+					wlr_output_state_set_mode(&state, wlr_output_preferred_mode(o));
+				wlr_output_commit_state(o, &state);
+				wlr_output_state_finish(&state);
+				changed = 1;
+			}
+			break;
+		}
+	}
+
+	/* Pass 3: place outputs in the layout according to their rule */
+	for (i = 0; i < cfg_output_rule_count; i++) {
+		wl_list_for_each(m, &mons, link) {
+			struct wlr_output *o;
+			if (m->wlr_output->non_desktop)
+				continue;
+			if (strcmp(m->wlr_output->name, cfg_output_rules[i].name) != 0)
+				continue;
+			o = m->wlr_output;
+			if (!o->enabled)
+				break;
+			if (cfg_output_rules[i].mode == MONITORMENU_ACTION_MIRROR) {
+				if (primary_mon && primary_mon != m &&
+				    primary_mon->wlr_output->enabled) {
+					monitormenu_layout_mirror(m, primary_mon);
+				} else {
+					monitormenu_layout_individual(m);
+				}
+			} else if (cfg_output_rules[i].mode == MONITORMENU_ACTION_INDIVIDUAL) {
+				monitormenu_layout_individual(m);
+			}
+			break;
+		}
+	}
+
+	if (changed)
+		updatemons(NULL, NULL);
+
+	display_rules_applying = 0;
+}
+
+/* Scheme function: (define-output-rule "NAME" 'mode [#t]) */
+static s7_pointer
+scm_define_output_rule(s7_scheme *sc, s7_pointer args)
+{
+	const char *name, *mname;
+	int mode, primary, i;
+
+	if (!s7_is_string(s7_car(args)) || !s7_is_symbol(s7_cadr(args)))
+		return s7_f(sc);
+	name = s7_string(s7_car(args));
+	mname = s7_symbol_name(s7_cadr(args));
+	primary = (s7_cddr(args) != s7_nil(sc))
+		? s7_boolean(sc, s7_caddr(args)) : 0;
+
+	if (strcmp(mname, "off") == 0)
+		mode = MONITORMENU_ACTION_OFF;
+	else if (strcmp(mname, "mirror") == 0)
+		mode = MONITORMENU_ACTION_MIRROR;
+	else if (strcmp(mname, "individual") == 0)
+		mode = MONITORMENU_ACTION_INDIVIDUAL;
+	else
+		mode = 0;
+
+	for (i = 0; i < cfg_output_rule_count; i++) {
+		if (strcmp(cfg_output_rules[i].name, name) == 0) {
+			cfg_output_rules[i].mode = mode;
+			cfg_output_rules[i].primary = primary;
+			return s7_t(sc);
+		}
+	}
+	if (cfg_output_rule_count < OUTPUT_RULE_MAX) {
+		strncpy(cfg_output_rules[cfg_output_rule_count].name, name,
+			sizeof(cfg_output_rules[cfg_output_rule_count].name) - 1);
+		cfg_output_rules[cfg_output_rule_count].name[
+			sizeof(cfg_output_rules[cfg_output_rule_count].name) - 1] = '\0';
+		cfg_output_rules[cfg_output_rule_count].mode = mode;
+		cfg_output_rules[cfg_output_rule_count].primary = primary;
+		cfg_output_rule_count++;
+	}
+	return s7_t(sc);
+}
+
+/* Append an owned copy of `text` to the label array (all labels are freed at
+ * the end of updatemonitormenu, so nothing may be a string literal). */
+static void
+monitormenu_addlabel(char **labels, int *n, const char *text)
+{
+	char *buf = ecalloc(1, 48);
+	snprintf(buf, 48, "%s", text);
+	labels[(*n)++] = buf;
+}
+
+/* Draw one content row (no swatch). */
+static void
+monitormenu_row(uint32_t *pixels, int menu_width, int menu_height, int row,
+                const char *text, int is_selected,
+                uint32_t text_color, uint32_t hi_bg, uint32_t hi_fg)
+{
+	int text_y = (row + 1) * cell_height;
+	int limit = menu_width / cell_width - 2;
+	int ci, px, py;
+
+	if (is_selected)
+		for (py = text_y; py < text_y + cell_height; py++)
+			for (px = cell_width; px < menu_width - cell_width; px++)
+				pixels[py * menu_width + px] = hi_bg;
+
+	for (ci = 0; text[ci] && ci < limit; ci++)
+		render_char_to_buffer(pixels, menu_width, menu_height,
+			cell_width + ci * cell_width, text_y,
+			(unsigned char)text[ci], is_selected ? hi_fg : text_color);
+}
+
+/* Render the whole menu into the cached buffer and attach it, centered. */
+static void
+updatemonitormenu(void)
+{
+	struct TitleBuffer *tb;
+	uint32_t *pixels;
+	char *labels[64];
+	int nitems = 0;
+	int menu_cells_w = 24;
+	int items, content_rows, menu_cells_h;
+	int menu_width, menu_height;
+	int maxlen = 0, i, x, y, col, row, cur_row;
+	uint32_t frame_bg, line_color, content_bg, text_color, hi_bg, hi_fg;
+	char title[48];
+	Monitor *m;
+
+	if (!monitormenu_active) {
+		if (monitormenu_buffer)
+			wlr_scene_node_set_enabled(&monitormenu_buffer->node, 0);
+		return;
+	}
+	m = selmon;
+	if (!m)
+		return;
+
+	/* If the configured output was physically unplugged (or demoted), drop the
+	 * deeper action views back to a valid level */
+	if (monitormenu_action_mode == 2 &&
+	    (!monitormenu_subtarget_valid() || monitormenu_subtarget == primary_mon ||
+	     !monitormenu_is_primary(monitormenu_target)))
+		monitormenu_action_mode = 1;
+	if (monitormenu_action_mode && !monitormenu_target_valid())
+		monitormenu_action_mode = 0;
+
+	/* Build the item list for the current level */
+	if (monitormenu_action_mode == 0) {
+		Monitor *mm;
+		int j;
+		for (j = 0; ; j++) {
+			int state;
+			char *buf;
+			mm = monitormenu_output_at(j);
+			if (!mm)
+				break;
+			state = monitormenu_state(mm);
+			buf = ecalloc(1, 64);
+			if (monitormenu_builtin(mm))
+				snprintf(buf, 64, "%s (Interna) %s%s", mm->wlr_output->name,
+					monitormenu_is_primary(mm) ? "Principal " : "Secundario ",
+					state == MONITORMENU_ACTION_OFF ? "No usar" :
+					state == MONITORMENU_ACTION_MIRROR ? "Duplicado" : "Individual");
+			else
+				snprintf(buf, 64, "%s %s%s", mm->wlr_output->name,
+					monitormenu_is_primary(mm) ? "Principal " : "Secundario ",
+					state == MONITORMENU_ACTION_OFF ? "No usar" :
+					state == MONITORMENU_ACTION_MIRROR ? "Duplicado" : "Individual");
+			labels[nitems++] = buf;
+		}
+	} else if (monitormenu_action_mode == 2) {
+		static const char *actions[] = { "Duplicado", "Individual", "No usar" };
+		static const int codes[] = {
+			MONITORMENU_ACTION_MIRROR, MONITORMENU_ACTION_INDIVIDUAL,
+			MONITORMENU_ACTION_OFF };
+		int cs = monitormenu_subtarget_valid()
+			? monitormenu_state(monitormenu_subtarget) : 0;
+		for (row = 0; row < 3; row++) {
+			char *buf = ecalloc(1, 32);
+			if (codes[row] == cs)
+				snprintf(buf, 32, "* %s", actions[row]);
+			else
+				snprintf(buf, 32, "  %s", actions[row]);
+			labels[nitems++] = buf;
+		}
+		monitormenu_addlabel(labels, &nitems, "Volver");
+	} else {
+		if (monitormenu_target_valid() && monitormenu_target == primary_mon) {
+			Monitor *mm;
+			wl_list_for_each(mm, &mons, link) {
+				int state;
+				char *buf;
+				if (mm->wlr_output->non_desktop || mm == primary_mon)
+					continue;
+				state = monitormenu_state(mm);
+				buf = ecalloc(1, 32);
+				snprintf(buf, 32, "%s %s", mm->wlr_output->name,
+					state == MONITORMENU_ACTION_OFF ? "No usar" :
+					state == MONITORMENU_ACTION_MIRROR ? "Duplicado" : "Individual");
+				labels[nitems++] = buf;
+			}
+			monitormenu_addlabel(labels, &nitems, "Apagar principal");
+			monitormenu_addlabel(labels, &nitems, "Pasar a Secundario");
+			monitormenu_addlabel(labels, &nitems, "Volver");
+		} else {
+			monitormenu_addlabel(labels, &nitems, "No usar");
+			monitormenu_addlabel(labels, &nitems, "Principal");
+			monitormenu_addlabel(labels, &nitems, "Volver");
+		}
+	}
+	items = nitems;
+	if (items < 1)
+		items = 1;
+
+	for (i = 0; i < nitems; i++) {
+		int l = (int)strlen(labels[i]);
+		if (l > maxlen)
+			maxlen = l;
+	}
+	menu_cells_w = maxlen + 6;
+	if (menu_cells_w < 24)
+		menu_cells_w = 24;
+	if (menu_cells_w > 48)
+		menu_cells_w = 48;
+
+	content_rows = items < 20 ? items : 20;
+	if (content_rows < 1)
+		content_rows = 1;
+	menu_cells_h = content_rows + 2;
+	if (menu_cells_h < 5)
+		menu_cells_h = 5;
+
+	if (monitormenu_selected_row > items - 1)
+		monitormenu_selected_row = items - 1;
+
+	menu_width  = menu_cells_w * cell_width;
+	menu_height = menu_cells_h * cell_height;
+	frame_bg   = premul_argb(cfg_border_color);
+	line_color = RGB_TO_ARGB(cfg_border_line_color);
+	content_bg = premul_argb(cfg_menu_color);
+	text_color = RGB_TO_ARGB(cfg_menu_text_color);
+	hi_bg      = premul_argb(cfg_border_color);
+	hi_fg      = line_color;
+
+	if (!monitormenu_tb) {
+		monitormenu_tb = ecalloc(1, sizeof(*monitormenu_tb));
+		monitormenu_tb->stride = menu_width * 4;
+		monitormenu_tb->data = ecalloc(1, monitormenu_tb->stride * menu_height);
+		wlr_buffer_init(&monitormenu_tb->base, &titlebuf_impl, menu_width, menu_height);
+		titlebuf_alloc_count++;
+	} else if (monitormenu_tb->base.width != (size_t)menu_width ||
+	           monitormenu_tb->base.height != (size_t)menu_height) {
+		if (monitormenu_buffer)
+			wlr_scene_buffer_set_buffer(monitormenu_buffer, NULL);
+		wlr_buffer_drop(&monitormenu_tb->base);
+		monitormenu_tb = ecalloc(1, sizeof(*monitormenu_tb));
+		monitormenu_tb->stride = menu_width * 4;
+		monitormenu_tb->data = ecalloc(1, monitormenu_tb->stride * menu_height);
+		wlr_buffer_init(&monitormenu_tb->base, &titlebuf_impl, menu_width, menu_height);
+		titlebuf_alloc_count++;
+	}
+	tb = monitormenu_tb;
+	pixels = (uint32_t *)tb->data;
+
+	/* background + frame */
+	for (i = 0; i < menu_width * menu_height; i++)
+		pixels[i] = content_bg;
+	for (y = 0; y < cell_height; y++)
+		for (x = 0; x < menu_width; x++)
+			pixels[y * menu_width + x] = frame_bg;
+	for (y = (menu_cells_h - 1) * cell_height; y < menu_height; y++)
+		for (x = 0; x < menu_width; x++)
+			pixels[y * menu_width + x] = frame_bg;
+	for (y = 0; y < menu_height; y++) {
+		for (x = 0; x < cell_width; x++)
+			pixels[y * menu_width + x] = frame_bg;
+		for (x = (menu_cells_w - 1) * cell_width; x < menu_width; x++)
+			pixels[y * menu_width + x] = frame_bg;
+	}
+	render_char_to_buffer(pixels, menu_width, menu_height, 0, 0, 0x2554, line_color);
+	render_char_to_buffer(pixels, menu_width, menu_height, (menu_cells_w - 1) * cell_width, 0, 0x2557, line_color);
+	render_char_to_buffer(pixels, menu_width, menu_height, 0, (menu_cells_h - 1) * cell_height, 0x255A, line_color);
+	render_char_to_buffer(pixels, menu_width, menu_height, (menu_cells_w - 1) * cell_width, (menu_cells_h - 1) * cell_height, 0x255D, line_color);
+
+	if (monitormenu_action_mode == 2 && monitormenu_subtarget_valid())
+		snprintf(title, sizeof(title), "%s", monitormenu_subtarget->wlr_output->name);
+	else if (monitormenu_action_mode && monitormenu_target_valid())
+		snprintf(title, sizeof(title), "%s", monitormenu_target->wlr_output->name);
+	else
+		snprintf(title, sizeof(title), "Pantallas");
+	{
+		int tl = (int)strlen(title);
+		int ts = 2;
+		for (col = 1; col < menu_cells_w - 1; col++) {
+			if (col >= ts && col < ts + tl)
+				render_char_to_buffer(pixels, menu_width, menu_height,
+					col * cell_width, 0, title[col - ts], line_color);
+			else
+				render_char_to_buffer(pixels, menu_width, menu_height,
+					col * cell_width, 0, 0x2550, line_color);
+		}
+	}
+	for (col = 1; col < menu_cells_w - 1; col++)
+		render_char_to_buffer(pixels, menu_width, menu_height,
+			col * cell_width, (menu_cells_h - 1) * cell_height, 0x2550, line_color);
+	for (row = 1; row < menu_cells_h - 1; row++) {
+		render_char_to_buffer(pixels, menu_width, menu_height, 0, row * cell_height, 0x2551, line_color);
+		render_char_to_buffer(pixels, menu_width, menu_height,
+			(menu_cells_w - 1) * cell_width, row * cell_height, 0x2551, line_color);
+	}
+
+	cur_row = 0;
+	for (i = 0; i < nitems; i++) {
+		int is_sel;
+		if (i < monitormenu_scroll_offset)
+			continue;
+		if (cur_row >= content_rows)
+			break;
+		is_sel = (cur_row == monitormenu_selected_row);
+		monitormenu_row(pixels, menu_width, menu_height, cur_row,
+			labels[i], is_sel, text_color, hi_bg, hi_fg);
+		cur_row++;
+	}
+	for (i = 0; i < nitems; i++)
+		free(labels[i]);
+
+	if (!monitormenu_buffer)
+		monitormenu_buffer = wlr_scene_buffer_create(layers[LyrTop], NULL);
+	wlr_scene_node_set_enabled(&monitormenu_buffer->node, 1);
+	wlr_scene_node_set_position(&monitormenu_buffer->node,
+		m->m.x + (int)m->m.width / 2 - menu_width / 2,
+		m->m.y + (int)m->m.height / 2 - menu_height / 2);
+	wlr_scene_buffer_set_buffer(monitormenu_buffer, &tb->base);
+	/* buffer is cached for reuse; do not drop */
+}
+
+static void
+togglemonitormenu(const Arg *arg)
+{
+	(void)arg;
+	if (monitormenu_active) {
+		monitormenu_active = 0;
+		monitormenu_action_mode = 0;
+		monitormenu_target = NULL;
+		monitormenu_subtarget = NULL;
+		monitormenu_selected_row = 0;
+		monitormenu_scroll_offset = 0;
+		updatemonitormenu();
+		updatebars();
+		return;
+	}
+	monitormenu_active = 1;
+	monitormenu_action_mode = 0;
+	monitormenu_target = NULL;
+	monitormenu_subtarget = NULL;
+	monitormenu_selected_row = 0;
+	monitormenu_scroll_offset = 0;
+	updatemonitormenu();
+	updatebars();
+}
+
+/* Activate the item at absolute index `selected` (what Enter does). */
+static void
+monitormenu_activate(int selected)
+{
+	if (monitormenu_action_mode == 0) {
+		Monitor *t = monitormenu_output_at(selected);
+		if (t) {
+			monitormenu_target = t;
+			monitormenu_action_mode = 1;
+			monitormenu_selected_row = 0;
+			monitormenu_scroll_offset = 0;
+		}
+		updatemonitormenu();
+		return;
+	}
+	if (monitormenu_action_mode == 2) {
+		/* configure the subtarget: Duplicado / Individual / No usar / Volver */
+		if (selected == 3) {
+			monitormenu_action_mode = 1;
+			monitormenu_selected_row = 0;
+			monitormenu_scroll_offset = 0;
+		} else if (monitormenu_subtarget_valid()) {
+			monitormenu_apply(monitormenu_subtarget,
+				selected == 0 ? MONITORMENU_ACTION_MIRROR :
+				selected == 1 ? MONITORMENU_ACTION_INDIVIDUAL :
+				MONITORMENU_ACTION_OFF);
+		}
+		updatemonitormenu();
+		return;
+	}
+	if (monitormenu_target_valid()) {
+		if (monitormenu_target == primary_mon) {
+			/* rows: other outputs..., Apagar principal, Pasar a Secundario, Volver */
+			int oc = monitormenu_other_count();
+			if (selected < oc) {
+				monitormenu_subtarget = monitormenu_other_at(selected);
+				monitormenu_action_mode = 2;
+				monitormenu_selected_row = 0;
+				monitormenu_scroll_offset = 0;
+			} else if (selected == oc) {
+				monitormenu_apply(monitormenu_target,
+					MONITORMENU_ACTION_OFF);
+			} else if (selected == oc + 1) {
+				monitormenu_apply(monitormenu_target,
+					MONITORMENU_ACTION_SECONDARY);
+			} else {
+				monitormenu_action_mode = 0;
+				monitormenu_selected_row = 0;
+				monitormenu_scroll_offset = 0;
+			}
+		} else {
+			if (selected == 0)
+				monitormenu_apply(monitormenu_target,
+					MONITORMENU_ACTION_OFF);
+			else if (selected == 1)
+				monitormenu_apply(monitormenu_target,
+					MONITORMENU_ACTION_PRIMARY);
+			else {
+				monitormenu_action_mode = 0;
+				monitormenu_selected_row = 0;
+				monitormenu_scroll_offset = 0;
+			}
+		}
+	}
+	updatemonitormenu();
+}
+
+/* Screen rect occupied by the monitor menu (from the last render). */
+static int
+monitormenu_geom(int *mx, int *my, int *mw, int *mh)
+{
+	if (!monitormenu_buffer || !monitormenu_tb)
+		return 0;
+	*mx = (int)monitormenu_buffer->node.x;
+	*my = (int)monitormenu_buffer->node.y;
+	*mw = (int)monitormenu_tb->base.width;
+	*mh = (int)monitormenu_tb->base.height;
+	return 1;
+}
+
+static int
+monitormenu_key(xkb_keysym_t sym)
+{
+	int items, max_row;
+	int content_rows = 20;
+
+	if (sym == XKB_KEY_Escape) {
+		if (monitormenu_action_mode == 2) {
+			monitormenu_action_mode = 1;
+			monitormenu_selected_row = 0;
+			monitormenu_scroll_offset = 0;
+		} else if (monitormenu_action_mode == 1) {
+			monitormenu_action_mode = 0;
+			monitormenu_selected_row = 0;
+			monitormenu_scroll_offset = 0;
+		} else {
+			togglemonitormenu(NULL);
+		}
+		updatemonitormenu();
+		return 1;
+	}
+	if (sym == XKB_KEY_Left || sym == XKB_KEY_h || sym == XKB_KEY_BackSpace) {
+		if (monitormenu_action_mode == 2) {
+			monitormenu_action_mode = 1;
+			monitormenu_selected_row = 0;
+			monitormenu_scroll_offset = 0;
+		} else if (monitormenu_action_mode == 1) {
+			monitormenu_action_mode = 0;
+			monitormenu_selected_row = 0;
+			monitormenu_scroll_offset = 0;
+		}
+		updatemonitormenu();
+		return 1;
+	}
+	if (sym == XKB_KEY_Up || sym == XKB_KEY_k) {
+		if (monitormenu_selected_row + monitormenu_scroll_offset > 0) {
+			if (monitormenu_selected_row > 0)
+				monitormenu_selected_row--;
+			else if (monitormenu_scroll_offset > 0)
+				monitormenu_scroll_offset--;
+		}
+		updatemonitormenu();
+		return 1;
+	}
+	if (sym == XKB_KEY_Down || sym == XKB_KEY_j) {
+		items = monitormenu_items();
+		max_row = (items < content_rows) ? items - 1 : content_rows - 1;
+		if (max_row >= 0 &&
+		    monitormenu_selected_row + monitormenu_scroll_offset < max_row) {
+			if (monitormenu_selected_row < content_rows - 1)
+				monitormenu_selected_row++;
+			else
+				monitormenu_scroll_offset++;
+		}
+		updatemonitormenu();
+		return 1;
+	}
+	if (sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter ||
+	    sym == XKB_KEY_Right || sym == XKB_KEY_l) {
+		monitormenu_activate(monitormenu_selected_row + monitormenu_scroll_offset);
+		return 1;
+	}
+
+	return 0;
+}
+
+/* Scheme function: (toggle-monitormenu) */
+static s7_pointer
+scm_toggle_monitormenu(s7_scheme *sc, s7_pointer args)
+{
+	(void)args;
+	togglemonitormenu(NULL);
 	return s7_t(sc);
 }
 
@@ -13678,7 +14872,18 @@ updatebar(Monitor *m)
 		timing_end(TIMING_UPDATEBAR);
 		return;
 	}
-	
+
+	/* In mirror (Duplicado) mode the mirrored output renders the principal's
+	 * scene; only the principal's bar should be drawn. Disable the mirrored
+	 * output's own bar node and skip rendering it. */
+	if (!monitormenu_is_primary(m) &&
+	    monitormenu_state(m) == MONITORMENU_ACTION_MIRROR) {
+		if (m->bar)
+			wlr_scene_node_set_enabled(&m->bar->node, 0);
+		timing_end(TIMING_UPDATEBAR);
+		return;
+	}
+
 	/* Don't update bar if scene isn't ready */
 	if (!layers[LyrOverlay])
 		return;
@@ -15528,7 +16733,8 @@ updatemons(struct wl_listener *listener, void *data)
 		config_head->state.y = m->m.y;
 
 		if (!selmon) {
-			selmon = m;
+			selmon = (monitor_in_mons(primary_mon) &&
+				  primary_mon->wlr_output->enabled) ? primary_mon : m;
 		}
 	}
 
@@ -15570,6 +16776,10 @@ updatemons(struct wl_listener *listener, void *data)
 
 	/* Update REPL display now that we have a monitor */
 	updaterepl();
+
+	/* Refresh the display menu if it is open (outputs may have changed) */
+	if (monitormenu_active)
+		updatemonitormenu();
 
 	wlr_output_manager_v1_set_configuration(output_mgr, config);
 }
