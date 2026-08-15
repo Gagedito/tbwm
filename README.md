@@ -56,3 +56,23 @@ sudo make install
 configuration is done via ~/.config/tbwm/config.scm
 
 check out docs/configuration.md for all the options or just press super+\` to open the repl and figure it out yourself
+
+## menú de pantalla (M-P)
+
+Se abre con `M-P`. Lista cada salida conectada (el panel integrado se marca
+`(Interna)`) con su rol y su estado actual:
+
+- **Principal** — la salida de referencia, siempre primera en el listado. Al
+  seleccionarla puedes configurar cada una de las demás pantallas una por una,
+  y también apagarla o bajarla a Secundario.
+- **Secundario** — el resto de salidas. Se pueden apagar o ascender a Principal.
+
+Estado de cada salida:
+
+- **No usar** — mantiene la salida apagada.
+- **Individual** — escritorio extendido: cada pantalla muestra su propia área.
+- **Duplicado** — espeja el contenido del Principal de forma estable.
+
+El estado se guarda en `~/.config/tbwm/display.scm` y se restaura al iniciar la
+sesión o al conectar/desconectar una pantalla. El menú se maneja por completo
+con teclado y con ratón (hover resalta, click ejecuta, click fuera cierra).
