@@ -170,8 +170,6 @@ typedef struct {
 	/* Cached frame buffers for reuse (avoid per-frame allocation) */
 	struct TitleBuffer *frame_top_buf;
 	struct TitleBuffer *frame_bottom_buf;
-	struct TitleBuffer *frame_left_buf;
-	struct TitleBuffer *frame_right_buf;
 	int frame_width;  /* cached dimensions to detect resize */
 	int frame_height;
 	/* Pre-rendered scrolling title texture (rendered once, scrolled by offset) */
@@ -261,6 +259,8 @@ struct Monitor {
 	int bar_width;                /* cached width to detect resize */
 	int bar_tabs_start_x;         /* x position where tabs begin (for scroll-only updates) */
 	int bar_tabs_end_x;           /* x position where tabs end */
+	struct TitleBuffer *repl_buf; /* cached REPL buffer for reuse */
+	int repl_width, repl_height;  /* cached REPL buffer dimensions */
 	struct wl_listener frame;
 	struct wl_listener destroy;
 	struct wl_listener request_state;
@@ -523,7 +523,6 @@ static void repl_eval(void);
 static int replkey(xkb_keysym_t sym);
 static void updateframe(Client *c);
 static void updateframes(void);
-static int update_scroll_only(Client *c);
 static void setup_scroll_scene_buffer(Client *c, uint32_t fg_color, uint32_t bg_color);
 static void bar_button_centers(Monitor *m, int *settings_center, int *audio_center, int *net_center);
 static int centered_menu_x(Monitor *m, int button_center, int menu_width);
@@ -733,7 +732,6 @@ static struct wl_event_source *timing_timer = NULL;  /* dedicated timing report 
 #endif
 static uint32_t title_scroll_offset = 0; /* pixel offset for smooth title scrolling */
 static int title_scroll_mode = 1;        /* 0 = truncate with ..., 1 = scroll */
-static int title_scroll_speed = 30;      /* currently unused: scroll advances 1px per 30fps tick (~30 px/s) */
 static struct wl_event_source *scroll_timer = NULL;
 static int any_title_needs_scroll = 0;   /* track if any title needs scrolling */
 static int scroll_only_bar_update = 0;   /* 1 = only update scrolling tabs, skip static */
@@ -1086,10 +1084,8 @@ static char *cfg_startup_cmds[MAX_STARTUP_CMDS];
 static int cfg_startup_cmd_count = 0;
 static int cfg_startup_ran = 0;
 
-/* Legacy wlroots border colors (not really used with custom frames) */
+/* Legacy wlroots colors (not really used with custom frames) */
 static float cfg_rootcolor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-static float cfg_bordercolor[4] = {0.267f, 0.267f, 0.267f, 1.0f};
-static float cfg_focuscolor[4] = {0.0f, 0.333f, 0.467f, 1.0f};
 static float cfg_fullscreen_bg[4] = {0.0f, 0.0f, 0.0f, 1.0f};
 
 /* Grid font settings */
@@ -2689,6 +2685,14 @@ closemon(Monitor *m)
 		m->bar_buf = NULL;
 	}
 
+	/* Release cached REPL buffer */
+	if (m->repl_buf) {
+		if (m->repl)
+			wlr_scene_buffer_set_buffer(m->repl, NULL);
+		wlr_buffer_drop(&m->repl_buf->base);
+		m->repl_buf = NULL;
+	}
+
 	if (!nmons) {
 		selmon = NULL;
 	} else if (m == selmon) {
@@ -4037,10 +4041,9 @@ focusclient(Client *c, int lift)
 		selmon = c->mon;
 		c->isurgent = 0;
 
-		/* Don't change border color if there is an exclusive focus or we are
+		/* Don't change frame if there is an exclusive focus or we are
 		 * handling a drag operation */
 		if (!exclusive_focus && !seat->drag) {
-			client_set_border_color(c, cfg_focuscolor);
 			updateframe(c);
 		}
 	}
@@ -4059,7 +4062,6 @@ focusclient(Client *c, int lift)
 		/* Don't deactivate old client if the new one wants focus, as this causes issues with winecfg
 		 * and probably other clients */
 		} else if (old_c && !client_is_unmanaged(old_c) && (!c || !client_wants_focus(c))) {
-			client_set_border_color(old_c, cfg_bordercolor);
 			updateframe(old_c);
 			client_activate_surface(old, 0);
 		}
@@ -8927,16 +8929,6 @@ static s7_pointer scm_set_title_scroll_mode(s7_scheme *sc, s7_pointer args)
 	return s7_t(sc);
 }
 
-/* Scheme function: (set-title-scroll-speed speed) - set scroll speed (pixels per tick) */
-static s7_pointer scm_set_title_scroll_speed(s7_scheme *sc, s7_pointer args)
-{
-	if (!s7_is_integer(s7_car(args)))
-		return s7_f(sc);
-	title_scroll_speed = s7_integer(s7_car(args));
-	if (title_scroll_speed < 1) title_scroll_speed = 1;
-	return s7_t(sc);
-}
-
 /* Storage for Scheme keybindings (dynamic) */
 typedef struct {
 	uint32_t mod;
@@ -9656,7 +9648,6 @@ setup_scheme(void)
 	s7_define_function(sc, "help", scm_help, 0, 0, false, "(help) show available commands");
 	s7_define_function(sc, "chvt", scm_chvt, 1, 0, false, "(chvt n) switch to virtual terminal n");
 	s7_define_function(sc, "set-title-scroll-mode", scm_set_title_scroll_mode, 1, 0, false, "(set-title-scroll-mode mode) set title overflow mode: 0=truncate, 1=scroll");
-	s7_define_function(sc, "set-title-scroll-speed", scm_set_title_scroll_speed, 1, 0, false, "(set-title-scroll-speed speed) set scroll speed in pixels per tick");
 
 	/* Configuration setters - NEW CLEAN API */
 	s7_define_function(sc, "set-bg-color", scm_set_bg_color, 1, 0, false, "(set-bg-color \"#RRGGBB[AA]\") set background/REPL color");
@@ -9765,7 +9756,6 @@ static const char *default_config_parts[] = {
 "\n"
 ";; Title bar scrolling for long titles\n"
 "(set-title-scroll-mode 1)   ; 1 = scroll, 0 = truncate with ...\n"
-"(set-title-scroll-speed 30) ; pixels per second\n"
 "\n"
 ";;;; ==================== BEHAVIOR ====================\n"
 "\n"
@@ -10372,9 +10362,9 @@ scrolltimer(void *data)
 	 * Dynamically detect whether anything needs scrolling so we always
 	 * run the fast tick while any title/tab is scrolling. */
 	if (!title_scroll_mode) {
-		/* keep 30fps while any menu marquee is active, else 100ms */
+		/* keep 30fps while any menu marquee is active, else idle 500ms */
 		wl_event_source_timer_update(scroll_timer,
-			MENU_MARQUEE_TICKING ? 33 : 100);
+			MENU_MARQUEE_TICKING ? 33 : 500);
 		return 0;
 	}
 
@@ -10416,10 +10406,10 @@ scrolltimer(void *data)
 
 	if (!needs_scroll) {
 		/* No titles need scrolling; keep the 30fps tick only while a menu
-		 * marquee is active, otherwise check again at 200ms. */
+		 * marquee is active, otherwise check again at 500ms. */
 		any_title_needs_scroll = 0;
 		wl_event_source_timer_update(scroll_timer,
-			MENU_MARQUEE_TICKING ? 33 : 200);
+			MENU_MARQUEE_TICKING ? 33 : 500);
 		return 0;
 	}
 	any_title_needs_scroll = 1;
@@ -11583,7 +11573,7 @@ updatethememenu(void)
 	int menu_cells_w, menu_cells_h;
 	int menu_width, menu_height;
 	int items, content_rows, footer_row, maxlen = 0;
-	int i, x, y, col, row, cur_row = 0, ci;
+	int i, x, y, col, row, cur_row = 0;
 	uint32_t frame_bg, line_color, content_bg, text_color, hi_bg, hi_fg;
 	char title[40];
 	Monitor *m;
@@ -14583,7 +14573,6 @@ crash_handler(int sig)
 {
 	void *frames[64];
 	int n = backtrace(frames, 64), fd;
-	int w = 0;
 	const char *msg = "\n=== tbwm crash (signal ";
 
 	dprintf(2, "%s%d%s", msg, sig, ") ===\n");
@@ -14591,7 +14580,7 @@ crash_handler(int sig)
 	fd = (crash_log) ? open(crash_log, O_WRONLY | O_CREAT | O_APPEND, 0644) : -1;
 	if (fd < 0)
 		goto out;
-	w += dprintf(fd, "\n=== tbwm crash (signal %d) at %ld ===\n", sig,
+	dprintf(fd, "\n=== tbwm crash (signal %d) at %ld ===\n", sig,
 		(long)time(NULL));
 	backtrace_symbols_fd(frames, n, fd);
 	close(fd);
@@ -14787,10 +14776,18 @@ updaterepl(void)
 
 	Monitor *m;
 	wl_list_for_each(m, &mons, link) {
-		/* Hide per-monitor REPL if not visible */
+		/* Hide per-monitor REPL if not visible (and release the cached
+		 * buffer so the ~MBs aren't kept resident between sessions) */
 		if (!repl_visible) {
-			if (m->repl)
+			if (m->repl) {
 				wlr_scene_node_set_enabled(&m->repl->node, 0);
+				if (m->repl_buf) {
+					wlr_scene_buffer_set_buffer(m->repl, NULL);
+					wlr_buffer_drop(&m->repl_buf->base);
+					m->repl_buf = NULL;
+					m->repl_width = m->repl_height = 0;
+				}
+			}
 			continue;
 		}
 
@@ -14799,11 +14796,22 @@ updaterepl(void)
 		if (width <= 0 || height <= 0)
 			continue;
 
-		/* Create buffer for this monitor's REPL background */
-		tb = ecalloc(1, sizeof(*tb));
-		tb->stride = width * 4;
-		tb->data = ecalloc(1, tb->stride * height);
-		titlebuf_alloc_count++; wlr_buffer_init(&tb->base, &titlebuf_impl, width, height);
+		/* Reuse the cached buffer when the monitor hasn't resized */
+		if (m->repl_buf && (m->repl_width != width || m->repl_height != height)) {
+			if (m->repl)
+				wlr_scene_buffer_set_buffer(m->repl, NULL);
+			wlr_buffer_drop(&m->repl_buf->base);
+			m->repl_buf = NULL;
+		}
+		if (!m->repl_buf) {
+			m->repl_buf = ecalloc(1, sizeof(*m->repl_buf));
+			m->repl_buf->stride = width * 4;
+			m->repl_buf->data = ecalloc(1, m->repl_buf->stride * height);
+			titlebuf_alloc_count++; wlr_buffer_init(&m->repl_buf->base, &titlebuf_impl, width, height);
+			m->repl_width = width;
+			m->repl_height = height;
+		}
+		tb = m->repl_buf;
 		pixels = tb->data;
 
 		/* Fill with background color */
@@ -14847,7 +14855,7 @@ updaterepl(void)
 		wlr_scene_node_set_enabled(&m->repl->node, 1);
 		wlr_scene_node_set_position(&m->repl->node, m->m.x, m->m.y);
 		wlr_scene_buffer_set_buffer(m->repl, &tb->base);
-		wlr_buffer_drop(&tb->base);
+		/* Don't drop - we're caching the buffer for reuse */
 	}
 }
 
@@ -15563,7 +15571,6 @@ get_cached_glyph(unsigned long charcode)
 	 * can reliably detect whether a face contains the glyph, then load and
 	 * render it. Fall back to the fallback face if primary lacks it, and
 	 * finally try the '?' glyph on either face. */
-	int used_fallback = 0;
 	FT_UInt glyph_index = 0;
 	FT_Error ferr = 1;
 
@@ -15586,7 +15593,6 @@ get_cached_glyph(unsigned long charcode)
 				ferr = FT_Render_Glyph(ft_fallback_face->glyph, FT_RENDER_MODE_NORMAL);
 			if (!ferr) {
 				slot = ft_fallback_face->glyph;
-				used_fallback = 1;
 				tbwm_log(TBWM_LOG_DEBUG, "glyph U+%04lx loaded from fallback font", charcode);
 			}
 		}
@@ -15616,7 +15622,6 @@ get_cached_glyph(unsigned long charcode)
 						ferr = FT_Render_Glyph(ft_fallback_face->glyph, FT_RENDER_MODE_NORMAL);
 					if (!ferr) {
 						slot = ft_fallback_face->glyph;
-						used_fallback = 1;
 					}
 				}
 			}
@@ -15767,6 +15772,16 @@ ensure_scroll_title_buffer(Client *c, const char *title, uint32_t fg_color, uint
 		scroll_chars++;
 	}
 	scroll_chars += 2; /* "  " separator */
+
+	/* Cap the texture size to the visible title area (plus a wrap margin)
+	 * so pathological long titles can't balloon RAM per client. */
+	if (c->scroll_display_width > 0) {
+		int visible_cells = c->scroll_display_width / cell_width;
+		if (visible_cells < 8)
+			visible_cells = 8;
+		if (scroll_chars > visible_cells + 8)
+			scroll_chars = visible_cells + 8;
+	}
 	
 	one_cycle_width = scroll_chars * cell_width;
 	c->scroll_title_width = one_cycle_width;
@@ -15899,32 +15914,30 @@ setup_scroll_scene_buffer(Client *c, uint32_t fg_color, uint32_t bg_color)
 	wlr_scene_buffer_set_source_box(c->scroll_scene_buf, &src_box);
 }
 
-/* FAST PATH: Pan the source_box in the pre-rendered scroll buffer.
- * ZERO memcpy - just shifts a rectangle coordinate in the GPU texture!
- * Returns 1 if fast path succeeded, 0 if full update needed. */
-static int
-update_scroll_only(Client *c)
+/* Shared 8x16 tile used as the vertical side frames of every window
+ * (solid background + ║), stretched with nearest-neighbour scaling.  One
+ * buffer instead of one tall buffer per client saves ~20 KB/window. */
+static int side_tile_ready = 0;
+static struct TitleBuffer side_tile;
+
+static void
+ensure_side_tile(void)
 {
-	int pixel_offset;
-	struct wlr_fbox src_box;
-	
-	if (!c || !c->scroll_scene_buf || !c->scroll_title_pixels)
-		return 0;
-	if (!c->needs_title_scroll || c->scroll_title_width <= 0)
-		return 0;
-	if (c->scroll_display_width <= 0)
-		return 0;
-	
-	pixel_offset = title_scroll_offset % c->scroll_title_width;
-	
-	/* Just shift the source_box - NO pixel copying! */
-	src_box.x = pixel_offset;
-	src_box.y = 0;
-	src_box.width = c->scroll_display_width;
-	src_box.height = cell_height;
-	wlr_scene_buffer_set_source_box(c->scroll_scene_buf, &src_box);
-	
-	return 1;
+	uint32_t *pixels;
+	int i;
+	if (side_tile_ready)
+		return;
+	memset(&side_tile, 0, sizeof(side_tile));
+	side_tile.stride = cell_width * 4;
+	side_tile.data = ecalloc(1, side_tile.stride * cell_height);
+	pixels = side_tile.data;
+	for (i = 0; i < cell_width * cell_height; i++)
+		pixels[i] = premul_argb(RGB_TO_ARGB(cfg_border_color));
+	render_char_to_buffer(pixels, cell_width, cell_height, 0, 0,
+		0x2551, RGB_TO_ARGB(cfg_border_line_color)); /* ║ */
+	wlr_buffer_init(&side_tile.base, &titlebuf_impl, cell_width, cell_height);
+	titlebuf_alloc_count++;
+	side_tile_ready = 1;
 }
 
 void
@@ -15936,7 +15949,7 @@ updateframe(Client *c)
 	int focused;
 	int title_len;
 	unsigned long tl_char, tr_char, bl_char, br_char;
-	unsigned long h_line, v_line;
+	unsigned long h_line;
 	uint32_t bg_color;
 	struct TitleBuffer *tb;
 	uint32_t *pixels;
@@ -15986,18 +15999,6 @@ updateframe(Client *c)
 			wlr_buffer_drop(&c->frame_bottom_buf->base);
 			c->frame_bottom_buf = NULL;
 		}
-		if (c->frame_left_buf) {
-			if (c->frame_left)
-				wlr_scene_buffer_set_buffer(c->frame_left, NULL);
-			wlr_buffer_drop(&c->frame_left_buf->base);
-			c->frame_left_buf = NULL;
-		}
-		if (c->frame_right_buf) {
-			if (c->frame_right)
-				wlr_scene_buffer_set_buffer(c->frame_right, NULL);
-			wlr_buffer_drop(&c->frame_right_buf->base);
-			c->frame_right_buf = NULL;
-		}
 		c->frame_width = width;
 		c->frame_height = height;
 	}
@@ -16013,7 +16014,6 @@ updateframe(Client *c)
 
 	/* Always use double-line characters */
 	h_line = 0x2550; /* ═ double horizontal */
-	v_line = 0x2551; /* ║ double vertical */
 	
 	/* Double-line corners */
 	if (above && left)       tl_char = 0x256C; /* ╬ */
@@ -16287,29 +16287,14 @@ updateframe(Client *c)
 		int rows = side_height / cell_height;
 		
 		if (rows > 0) {
-			/* Reuse buffer if dimensions match */
-			if (!c->frame_left_buf) {
-				c->frame_left_buf = ecalloc(1, sizeof(*c->frame_left_buf));
-				c->frame_left_buf->stride = cell_width * 4;
-				c->frame_left_buf->data = ecalloc(1, c->frame_left_buf->stride * side_height);
-				wlr_buffer_init(&c->frame_left_buf->base, &titlebuf_impl, cell_width, side_height);
-				titlebuf_alloc_count++;
-			}
-			tb = c->frame_left_buf;
-			pixels = tb->data;
-			
-			/* Clear buffer */
-			for (i = 0; i < cell_width * side_height; i++)
-				pixels[i] = premul_argb(bg_color);
-
-			for (i = 0; i < rows; i++)
-				render_char_to_buffer(pixels, cell_width, side_height, 0, i * cell_height, v_line, RGB_TO_ARGB(cfg_border_line_color));
-
+			/* Shared 8x16 tile stretched to the column height */
+			ensure_side_tile();
 			if (!c->frame_left)
 				c->frame_left = wlr_scene_buffer_create(c->scene, NULL);
 			wlr_scene_node_set_position(&c->frame_left->node, 0, cell_height);
-			wlr_scene_buffer_set_buffer(c->frame_left, &tb->base);
-			/* Don't drop - we're caching the buffer for reuse */
+			wlr_scene_buffer_set_buffer(c->frame_left, &side_tile.base);
+			wlr_scene_buffer_set_dest_size(c->frame_left, cell_width, side_height);
+			wlr_scene_buffer_set_filter_mode(c->frame_left, WLR_SCALE_FILTER_NEAREST);
 		}
 	} else if (c->frame_left) {
 		wlr_scene_buffer_set_buffer(c->frame_left, NULL);
@@ -16322,29 +16307,14 @@ updateframe(Client *c)
 		int rows = side_height / cell_height;
 		
 		if (rows > 0) {
-			/* Reuse buffer if dimensions match */
-			if (!c->frame_right_buf) {
-				c->frame_right_buf = ecalloc(1, sizeof(*c->frame_right_buf));
-				c->frame_right_buf->stride = cell_width * 4;
-				c->frame_right_buf->data = ecalloc(1, c->frame_right_buf->stride * side_height);
-				wlr_buffer_init(&c->frame_right_buf->base, &titlebuf_impl, cell_width, side_height);
-				titlebuf_alloc_count++;
-			}
-			tb = c->frame_right_buf;
-			pixels = tb->data;
-			
-			/* Clear buffer */
-			for (i = 0; i < cell_width * side_height; i++)
-				pixels[i] = premul_argb(bg_color);
-
-			for (i = 0; i < rows; i++)
-				render_char_to_buffer(pixels, cell_width, side_height, 0, i * cell_height, v_line, RGB_TO_ARGB(cfg_border_line_color));
-
+			/* Shared 8x16 tile stretched to the column height */
+			ensure_side_tile();
 			if (!c->frame_right)
 				c->frame_right = wlr_scene_buffer_create(c->scene, NULL);
 			wlr_scene_node_set_position(&c->frame_right->node, width - cell_width, cell_height);
-			wlr_scene_buffer_set_buffer(c->frame_right, &tb->base);
-			/* Don't drop - we're caching the buffer for reuse */
+			wlr_scene_buffer_set_buffer(c->frame_right, &side_tile.base);
+			wlr_scene_buffer_set_dest_size(c->frame_right, cell_width, side_height);
+			wlr_scene_buffer_set_filter_mode(c->frame_right, WLR_SCALE_FILTER_NEAREST);
 		} else if (c->frame_right) {
 			wlr_scene_buffer_set_buffer(c->frame_right, NULL);
 		}
@@ -16621,14 +16591,16 @@ unmapnotify(struct wl_listener *listener, void *data)
 		wlr_buffer_drop(&c->frame_bottom_buf->base);
 		c->frame_bottom_buf = NULL;
 	}
-	if (c->frame_left_buf) {
-		wlr_buffer_drop(&c->frame_left_buf->base);
-		c->frame_left_buf = NULL;
+
+	/* Free the pre-rendered scroll title pixels and reset its bookkeeping
+	 * (a hidden client doesn't need a potentially MB-sized title texture) */
+	if (c->scroll_title_pixels) {
+		free(c->scroll_title_pixels);
+		c->scroll_title_pixels = NULL;
 	}
-	if (c->frame_right_buf) {
-		wlr_buffer_drop(&c->frame_right_buf->base);
-		c->frame_right_buf = NULL;
-	}
+	c->scroll_title_hash[0] = '\0';
+	c->scroll_texture_fg = c->scroll_texture_bg = 0;
+	c->scroll_pixels_dirty = 0;
 
 	/* Detach scroll buffers before destroying the scene node - scroll_scene_buf
 	 * is a child of c->scene, so touching it after the destroy would be a
@@ -16817,9 +16789,6 @@ urgent(struct wl_listener *listener, void *data)
 
 	c->isurgent = 1;
 	printstatus();
-
-	if (client_surface(c)->mapped)
-		client_set_border_color(c, urgentcolor);
 }
 
 void
@@ -17015,15 +16984,11 @@ void
 sethints(struct wl_listener *listener, void *data)
 {
 	Client *c = wl_container_of(listener, c, set_hints);
-	struct wlr_surface *surface = client_surface(c);
 	if (c == focustop(selmon) || !c->surface.xwayland->hints)
 		return;
 
 	c->isurgent = xcb_icccm_wm_hints_get_urgency(c->surface.xwayland->hints);
 	printstatus();
-
-	if (c->isurgent && surface && surface->mapped)
-		client_set_border_color(c, urgentcolor);
 }
 
 void

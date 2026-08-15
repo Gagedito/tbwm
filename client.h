@@ -311,14 +311,6 @@ client_send_close(Client *c)
 }
 
 static inline void
-client_set_border_color(Client *c, const float color[static 4])
-{
-	/* Text-based frame - color changes handled by updateframe() */
-	(void)c;
-	(void)color;
-}
-
-static inline void
 client_set_fullscreen(Client *c, int fullscreen)
 {
 #ifdef XWAYLAND

@@ -39,16 +39,7 @@ static const struct xkb_rule_names xkb_rules = {
 /* These are only used as compile-time defaults, actual values come from cfg_* variables */
 /* They exist here so old code doesn't break, but they're now superseded by runtime config */
 static const int sloppyfocus               = 1;
-static const int bypass_surface_visibility = 0;
 static const unsigned int borderpx         = 1;
-static const float rootcolor[]             = COLOR(0x000000ff);
-static const float bordercolor[]           = COLOR(0x444444ff);
-static const float focuscolor[]            = COLOR(0x005577ff);
-static const float urgentcolor[]           = COLOR(0xff0000ff);
-static const float fullscreen_bg[]         = {0.0f, 0.0f, 0.0f, 1.0f};
-static const uint32_t frame_bg_color       = 0xFF0000aa;
-static const uint32_t frame_bg_inactive    = 0xFF000000;
-static const uint32_t frame_fg_color       = 0xFFaaaaaa;
 static int log_level = WLR_ERROR;
 static const int repeat_rate = 25;
 static const int repeat_delay = 600;
