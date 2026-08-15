@@ -178,6 +178,9 @@ typedef struct {
 	uint32_t *scroll_title_pixels;  /* Pre-rendered title + "  " separator (doubled for wrap) */
 	int scroll_title_width;         /* Width of ONE cycle in pixels */
 	char scroll_title_hash[128];    /* Hash of title to detect changes */
+	uint32_t scroll_texture_fg;     /* colors used in the pre-rendered texture */
+	uint32_t scroll_texture_bg;
+	int scroll_pixels_dirty;        /* texture regenerated; needs re-upload to scene */
 	/* Dedicated scene buffer for scrolling - uses source_box panning */
 	struct wlr_scene_buffer *scroll_scene_buf;
 	struct TitleBuffer *scroll_buf;  /* The actual buffer (2x width for seamless wrap) */
@@ -15117,19 +15120,12 @@ render_tabs:
 				/* Check if this tab needs scrolling */
 				int needs_scroll = (title_len > title_max - 1 && title_scroll_mode);
 				
-				/* During scroll-only update, skip tabs that don't need scrolling */
-				if (scroll_only_bar_update && !needs_scroll) {
-					/* Just advance x position, don't re-render */
-					x += actual_tab_width + cell_width / 2;
-					continue;
-				}
-				
-				/* Draw background - always needed for scrolling tabs to clear previous frame */
-				if (is_focused || (scroll_only_bar_update && needs_scroll)) {
-					for (py = 0; py < cell_height; py++) {
-						for (px = x; px < x + actual_tab_width && px < width; px++) {
-							pixels[py * width + px] = premul_argb(bg);
-						}
+				/* Draw background - always needed for scrolling tabs to clear
+				 * previous frame; in scroll-only updates it also re-syncs
+				 * every tab so stale text can't overlap. */
+				for (py = 0; py < cell_height; py++) {
+					for (px = x; px < x + actual_tab_width && px < width; px++) {
+						pixels[py * width + px] = premul_argb(bg);
 					}
 				}
 
@@ -15750,8 +15746,9 @@ ensure_scroll_title_buffer(Client *c, const char *title, uint32_t fg_color, uint
 	int scroll_chars, one_cycle_width, total_width, pos, i;
 	uint32_t *pixels;
 	
-	/* Check if we need to regenerate (title changed) */
-	if (c->scroll_title_pixels && 
+	/* Check if we need to regenerate (title or colors changed) */
+	if (c->scroll_title_pixels &&
+	    c->scroll_texture_fg == fg_color && c->scroll_texture_bg == bg_color &&
 	    strncmp(c->scroll_title_hash, title, sizeof(c->scroll_title_hash) - 1) == 0) {
 		return; /* Already have correct buffer */
 	}
@@ -15800,6 +15797,9 @@ ensure_scroll_title_buffer(Client *c, const char *title, uint32_t fg_color, uint
 	/* Remember the title hash */
 	strncpy(c->scroll_title_hash, title, sizeof(c->scroll_title_hash) - 1);
 	c->scroll_title_hash[sizeof(c->scroll_title_hash) - 1] = '\0';
+	c->scroll_texture_fg = fg_color;
+	c->scroll_texture_bg = bg_color;
+	c->scroll_pixels_dirty = 1;
 }
 
 /* Fast blit from pre-rendered scroll buffer to frame buffer.
@@ -15861,10 +15861,11 @@ setup_scroll_scene_buffer(Client *c, uint32_t fg_color, uint32_t bg_color)
 		need_upload = 1; /* New buffer - need to copy pixels */
 	}
 	
-	/* Only copy pre-rendered pixels if buffer was just created */
-	if (need_upload) {
+	/* Copy pre-rendered pixels if the buffer is new or the texture changed */
+	if (need_upload || c->scroll_pixels_dirty) {
 		memcpy(c->scroll_buf->data, c->scroll_title_pixels, 
 		       total_width * cell_height * sizeof(uint32_t));
+		c->scroll_pixels_dirty = 0;
 	}
 	
 	/* Create scene buffer if needed */
@@ -15879,6 +15880,8 @@ setup_scroll_scene_buffer(Client *c, uint32_t fg_color, uint32_t bg_color)
 	/* Position the overlay exactly over the title area in the frame */
 	wlr_scene_node_set_position(&c->scroll_scene_buf->node, 
 	                            c->scroll_dest_x, 0);
+	/* Re-show the overlay (hidden when the title stopped overflowing) */
+	wlr_scene_node_set_enabled(&c->scroll_scene_buf->node, 1);
 	
 	/* Only update buffer binding if we just uploaded new pixels */
 	if (need_upload) {
@@ -15952,6 +15955,8 @@ updateframe(Client *c)
 			wlr_scene_buffer_set_buffer(c->frame_left, NULL);
 		if (c->frame_right)
 			wlr_scene_buffer_set_buffer(c->frame_right, NULL);
+		if (c->scroll_scene_buf)
+			wlr_scene_node_set_enabled(&c->scroll_scene_buf->node, 0);
 		return;
 	}
 
@@ -16134,6 +16139,10 @@ updateframe(Client *c)
 			int text_cells = avail_cells - ellipsis_cells;
 			if (text_cells < 0) text_cells = 0;
 			
+			/* Hide any leftover scrolling overlay */
+			if (c->scroll_scene_buf)
+				wlr_scene_node_set_enabled(&c->scroll_scene_buf->node, 0);
+			
 			/* Fill background */
 			{
 				int bg_start = title_x;
@@ -16167,6 +16176,9 @@ updateframe(Client *c)
 			render_char_to_buffer(pixels, width, cell_height, title_x, 0, '.', title_fg);
 		} else {
 			/* Title fits - render normally */
+			/* Hide any leftover scrolling overlay */
+			if (c->scroll_scene_buf)
+				wlr_scene_node_set_enabled(&c->scroll_scene_buf->node, 0);
 			/* Fill background */
 			{
 				int bg_start = title_x;
