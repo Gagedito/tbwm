@@ -438,6 +438,7 @@ static void setsel(struct wl_listener *listener, void *data);
 static void setup(void);
 static void setup_scheme(void);
 static void load_config(void);
+static s7_pointer tbwm_load_file_fn;
 static void setup_foot_config(void);
 static int check_scheme_bindings(uint32_t mods, xkb_keysym_t sym);
 static void setupgrid(void);
@@ -9942,6 +9943,30 @@ load_config(void)
 	if (!home || !sc)
 		return;
 
+	/* Define a per-form config loader once. Unlike s7_load, an error in one
+	 * top-level form is reported visibly and loading continues with the next
+	 * form instead of silently aborting the rest of the file. */
+	if (!tbwm_load_file_fn) {
+		tbwm_load_file_fn = s7_eval_c_string(sc,
+			"(define (tbwm-load-file f)\n"
+			"  (catch #t\n"
+			"    (lambda ()\n"
+			"      (call-with-input-file f\n"
+			"        (lambda (port)\n"
+			"          (let loop ()\n"
+			"            (let ((form (read port)))\n"
+			"              (if (eof-object? form)\n"
+			"                  (list '*tbwm-loaded* f)\n"
+			"                  (begin\n"
+			"                    (catch #t\n"
+			"                      (lambda () (eval form (rootlet)))\n"
+			"                      (lambda (type data)\n"
+			"                        (format *stderr* \"~%tbwm: bad config form in ~A~%   form: ~S~%   error: ~S ~S~%\" f form type data)))\n"
+			"                    (loop))))))))\n"
+			"    (lambda (type data)\n"
+			"      (format *stderr* \"~%tbwm: cannot load config file ~A: ~S ~S~%\" f type data))))");
+	}
+
 	snprintf(dir, sizeof(dir), "%s/.config/tbwm", home);
 	snprintf(path, sizeof(path), "%s/config.scm", dir);
 	
@@ -9982,7 +10007,7 @@ load_config(void)
 			cfg_startup_cmds[i] = NULL;
 		}
 		cfg_startup_cmd_count = 0;
-		s7_load(sc, path);
+		s7_apply_function(sc, tbwm_load_file_fn, s7_list(sc, 1, s7_make_string(sc, path)));
 		/* Apply saved theme colors (from M-t menu) after the main config */
 		{
 			char tpath[1024];
@@ -9992,7 +10017,7 @@ load_config(void)
 			if (tf) {
 				fclose(tf);
 				tbwm_log(TBWM_LOG_INFO, "tbwm: applying saved theme from %s\n", tpath);
-				s7_load(sc, tpath);
+				s7_apply_function(sc, tbwm_load_file_fn, s7_list(sc, 1, s7_make_string(sc, tpath)));
 			}
 		}
 		/* Apply saved display config (from M-P menu) after the main config */
@@ -10005,7 +10030,7 @@ load_config(void)
 			if (df) {
 				fclose(df);
 				tbwm_log(TBWM_LOG_INFO, "tbwm: applying saved display config from %s\n", dpath);
-				s7_load(sc, dpath);
+				s7_apply_function(sc, tbwm_load_file_fn, s7_list(sc, 1, s7_make_string(sc, dpath)));
 			}
 		}
 		/* Apply the saved rules to the connected outputs (no-op at cold start
@@ -10490,6 +10515,10 @@ togglelauncher(const Arg *arg)
 	launcher_active = !launcher_active;
 	launcher_input[0] = '\0';
 	launcher_input_len = 0;
+	/* Rebuild the app cache on open so newly installed apps (e.g. flatpak
+	 * exports) show up without restarting the session. */
+	if (launcher_active)
+		buildappcache();
 	updatebars();
 }
 
@@ -10712,6 +10741,10 @@ toggleappmenu(const Arg *arg)
 		updatemenuaudio();
 		updatenetmenu();
 		updatetraymenu();
+		/* Re-scan every time we open so newly installed apps (e.g. flatpak)
+		 * show up without restarting the session. Fixed static arrays make
+		 * this safe; load_applications() resets the counters itself. */
+		apps_loaded = 0;
 		load_applications();
 		menu_current_category = -1;
 		menu_scroll_offset = 0;

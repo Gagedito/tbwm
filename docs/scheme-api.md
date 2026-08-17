@@ -29,7 +29,6 @@ all the functions you can use in config.scm
 (set-show-time #t)          ; show/hide time
 (set-status-text "text")    ; custom status (replaces date/time)
 (set-title-scroll-mode 1)   ; 0=truncate, 1=scroll
-(set-title-scroll-speed 30) ; pixels/sec
 ```
 
 ## keybindings
